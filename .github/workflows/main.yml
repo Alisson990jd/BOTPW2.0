@@ -1,9 +1,9 @@
-name: Bot Cíclico - Execução a cada 12h
+name: Bot Cíclico - Execução a cada 6h
 
 on:
   schedule:
-    # Executa a cada 12 horas (00:00 e 12:00 UTC)
-    - cron: '0 */12 * * *'
+    # Executa a cada 6 horas (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
   
   workflow_dispatch:
     # Permite execução manual
@@ -11,7 +11,7 @@ on:
       duracao_horas:
         description: 'Duração da execução em horas'
         required: false
-        default: '11'
+        default: '5'
         type: string
 
 env:
@@ -23,7 +23,7 @@ env:
 jobs:
   executar-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 720  # 12 horas de timeout máximo
+    timeout-minutes: 360  # 6 horas de timeout máximo
     
     steps:
       - name: 📋 Configurar Git
@@ -138,7 +138,7 @@ jobs:
             if echo "$RESPONSE" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
               echo "📦 Decodificando conteúdo base64..."
               
-              # CORREÇÃO AQUI: Criando script temporário para evitar erro de sintaxe YAML
+              # Criar script temporário para evitar erro de sintaxe YAML
               cat > decode_script.py << 'EOF'
           import sys, json, base64
           try:
@@ -150,7 +150,6 @@ jobs:
                   print('✅ Arquivo decodificado com sucesso!')
               else:
                   print('❌ Resposta da API não contém campo content')
-                  # Imprimir apenas início da resposta para debug
                   print('Resposta parcial:', json.dumps(data)[:200])
                   sys.exit(1)
           except Exception as e:
@@ -171,8 +170,6 @@ jobs:
                   echo "❌ Método 2 baixou arquivo inválido"
                 fi
               fi
-              
-              # Limpar script
               rm decode_script.py
             else
               echo "❌ Resposta da API inválida"
@@ -347,14 +344,14 @@ jobs:
       - name: 🚀 Executar start.py
         id: executar_bot
         env:
-          DURACAO_HORAS: ${{ github.event.inputs.duracao_horas || '11' }}
+          DURACAO_HORAS: ${{ github.event.inputs.duracao_horas || '5' }}
         run: |
           echo "🚀 Iniciando start.py..."
           echo "⏱️ Duração configurada: $DURACAO_HORAS horas"
           
           cd bot_workspace
           
-          # Calcular tempo em segundos (11 horas = 39600 segundos)
+          # Calcular tempo em segundos (5 horas = 18000 segundos)
           DURACAO_SEGUNDOS=$((DURACAO_HORAS * 3600))
           echo "⏱️ Duração em segundos: $DURACAO_SEGUNDOS"
           
@@ -530,8 +527,8 @@ jobs:
           echo "📋 RESUMO DA EXECUÇÃO"
           echo "╚════════════════════════════════════════╝"
           echo "📅 Data/Hora: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
-          echo "⏱️ Duração configurada: ${{ github.event.inputs.duracao_horas || '11' }} horas"
-          echo "🔄 Próxima execução: Em ~12 horas"
+          echo "⏱️ Duração configurada: ${{ github.event.inputs.duracao_horas || '5' }} horas"
+          echo "🔄 Próxima execução: Em ~6 horas"
           echo "╔════════════════════════════════════════╗"
           echo "✅ Workflow concluído com sucesso!"
           echo "╚════════════════════════════════════════╝"
