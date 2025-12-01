@@ -32,7 +32,7 @@ jobs:
       
       - name: 🔧 Instalar Dependências do Sistema
         run: |
-          echo "🔄 Atualizando repositórios..."
+          echo "📄 Atualizando repositórios..."
           sudo apt-get update -qq
           
           echo "📦 Instalando FFmpeg..."
@@ -189,61 +189,61 @@ jobs:
           
           # Criar script de execução com timeout
           cat > run_with_timeout.sh << 'EOF'
-#!/bin/bash
+          #!/bin/bash
 
-DURACAO=$1
-LOG_FILE="bot_execution.log"
+          DURACAO=$1
+          LOG_FILE="bot_execution.log"
 
-echo "🎬 Iniciando execução do bot..."
-echo "⏱️ Tempo máximo: $DURACAO segundos"
-echo "📝 Log será salvo em: $LOG_FILE"
+          echo "🎬 Iniciando execução do bot..."
+          echo "⏱️ Tempo máximo: $DURACAO segundos"
+          echo "📝 Log será salvo em: $LOG_FILE"
 
-# Executar start.py em background e capturar PID
-python3 -u start.py > "$LOG_FILE" 2>&1 &
-BOT_PID=$!
+          # Executar start.py em background e capturar PID
+          python3 -u start.py > "$LOG_FILE" 2>&1 &
+          BOT_PID=$!
 
-echo "✅ Bot iniciado com PID: $BOT_PID"
-echo "⏳ Aguardando $DURACAO segundos..."
+          echo "✅ Bot iniciado com PID: $BOT_PID"
+          echo "⏳ Aguardando $DURACAO segundos..."
 
-# Aguardar pela duração especificada
-sleep $DURACAO
+          # Aguardar pela duração especificada
+          sleep $DURACAO
 
-# Verificar se o processo ainda está rodando
-if kill -0 $BOT_PID 2>/dev/null; then
-  echo "⏹️ Tempo esgotado. Parando o bot..."
-  
-  # Enviar SIGTERM (interrupção graceful)
-  kill -TERM $BOT_PID 2>/dev/null
-  
-  # Aguardar até 30 segundos para o processo terminar
-  for i in {1..30}; do
-    if ! kill -0 $BOT_PID 2>/dev/null; then
-      echo "✅ Bot parado gracefully"
-      exit 0
-    fi
-    sleep 1
-  done
-  
-  # Se ainda estiver rodando, forçar
-  if kill -0 $BOT_PID 2>/dev/null; then
-    echo "⚠️ Processo não respondeu, forçando encerramento..."
-    kill -KILL $BOT_PID 2>/dev/null
-  fi
-  
-  echo "✅ Bot parado (forcefully)"
-else
-  echo "ℹ️ Bot já finalizou antes do timeout"
-fi
+          # Verificar se o processo ainda está rodando
+          if kill -0 $BOT_PID 2>/dev/null; then
+            echo "ℹ️ Tempo esgotado. Parando o bot..."
+            
+            # Enviar SIGTERM (interrupção graceful)
+            kill -TERM $BOT_PID 2>/dev/null
+            
+            # Aguardar até 30 segundos para o processo terminar
+            for i in {1..30}; do
+              if ! kill -0 $BOT_PID 2>/dev/null; then
+                echo "✅ Bot parado gracefully"
+                exit 0
+              fi
+              sleep 1
+            done
+            
+            # Se ainda estiver rodando, forçar
+            if kill -0 $BOT_PID 2>/dev/null; then
+              echo "⚠️ Processo não respondeu, forçando encerramento..."
+              kill -KILL $BOT_PID 2>/dev/null
+            fi
+            
+            echo "✅ Bot parado (forcefully)"
+          else
+            echo "ℹ️ Bot já finalizou antes do timeout"
+          fi
 
-# Exibir últimas linhas do log
-echo ""
-echo "📋 Últimas 50 linhas do log:"
-echo "─────────────────────────────────────────"
-tail -n 50 "$LOG_FILE"
-echo "─────────────────────────────────────────"
+          # Exibir últimas linhas do log
+          echo ""
+          echo "📋 Últimas 50 linhas do log:"
+          echo "─────────────────────────────────────────"
+          tail -n 50 "$LOG_FILE"
+          echo "─────────────────────────────────────────"
 
-exit 0
-EOF
+          exit 0
+          EOF
           
           chmod +x run_with_timeout.sh
           
@@ -336,17 +336,17 @@ EOF
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d "{\"message\":\"$MESSAGE\",\"content\":\"$BASE64_CONTENT\"}"
+              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'"}'
           else
             echo "✅ SHA obtido: ${SHA:0:7}..."
-            MESSAGE="🔄 Bot atualizado automaticamente - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
+            MESSAGE="📄 Bot atualizado automaticamente - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
             
             # Atualizar arquivo
             curl -X PUT \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d "{\"message\":\"$MESSAGE\",\"content\":\"$BASE64_CONTENT\",\"sha\":\"$SHA\"}"
+              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'","sha":"'"$SHA"'"}'
           fi
           
           echo "✅ Upload concluído!"
@@ -355,15 +355,15 @@ EOF
         if: always()
         run: |
           echo ""
-          echo "════════════════════════════════════════"
+          echo "╔════════════════════════════════════════╗"
           echo "📋 RESUMO DA EXECUÇÃO"
-          echo "════════════════════════════════════════"
+          echo "╚════════════════════════════════════════╝"
           echo "📅 Data/Hora: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
           echo "⏱️ Duração configurada: ${{ github.event.inputs.duracao_horas || '11' }} horas"
           echo "🔄 Próxima execução: Em ~12 horas"
-          echo "════════════════════════════════════════"
+          echo "╔════════════════════════════════════════╗"
           echo "✅ Workflow concluído com sucesso!"
-          echo "════════════════════════════════════════"
+          echo "╚════════════════════════════════════════╝"
       
       - name: 🧹 Limpeza de Arquivos Temporários
         if: always()
