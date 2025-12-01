@@ -78,7 +78,7 @@ jobs:
           
           # Método 1: Tentar download direto via raw.githubusercontent.com
           echo ""
-          echo "📄 Método 1: Download direto (raw.githubusercontent.com)..."
+          echo "🔄 Método 1: Download direto (raw.githubusercontent.com)..."
           
           # Tentar branch main
           RAW_URL="https://raw.githubusercontent.com/$OWNER/$REPO/main/$FILE"
@@ -123,7 +123,7 @@ jobs:
           # Método 2: Download via GitHub API
           if [ "$HTTP_CODE" != "200" ]; then
             echo ""
-            echo "📄 Método 2: Download via API do GitHub..."
+            echo "🔄 Método 2: Download via API do GitHub..."
             
             # Tentar branch main
             API_URL="https://api.github.com/repos/$OWNER/$REPO/contents/$FILE"
@@ -137,23 +137,29 @@ jobs:
             # Verificar se obteve resposta válida
             if echo "$RESPONSE" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
               echo "📦 Decodificando conteúdo base64..."
-              echo "$RESPONSE" | python3 -c "
-import sys, json, base64
-try:
-    data = json.load(sys.stdin)
-    if 'content' in data:
-        content = base64.b64decode(data['content'])
-        with open('bot.zip', 'wb') as f:
-            f.write(content)
-        print('✅ Arquivo decodificado com sucesso!')
-    else:
-        print('❌ Resposta da API não contém campo content')
-        print('Resposta:', json.dumps(data, indent=2)[:500])
-        sys.exit(1)
-except Exception as e:
-    print(f'❌ Erro ao processar resposta: {e}')
-    sys.exit(1)
-"
+              
+              # CORREÇÃO AQUI: Criando script temporário para evitar erro de sintaxe YAML
+              cat > decode_script.py << 'EOF'
+          import sys, json, base64
+          try:
+              data = json.load(sys.stdin)
+              if 'content' in data:
+                  content = base64.b64decode(data['content'])
+                  with open('bot.zip', 'wb') as f:
+                      f.write(content)
+                  print('✅ Arquivo decodificado com sucesso!')
+              else:
+                  print('❌ Resposta da API não contém campo content')
+                  # Imprimir apenas início da resposta para debug
+                  print('Resposta parcial:', json.dumps(data)[:200])
+                  sys.exit(1)
+          except Exception as e:
+              print(f'❌ Erro ao processar resposta: {e}')
+              sys.exit(1)
+          EOF
+              
+              # Executar o script criado
+              echo "$RESPONSE" | python3 decode_script.py
               
               if [ $? -eq 0 ] && [ -f bot.zip ]; then
                 BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
@@ -165,6 +171,9 @@ except Exception as e:
                   echo "❌ Método 2 baixou arquivo inválido"
                 fi
               fi
+              
+              # Limpar script
+              rm decode_script.py
             else
               echo "❌ Resposta da API inválida"
               echo "Resposta: ${RESPONSE:0:500}"
@@ -350,10 +359,10 @@ except Exception as e:
           echo "⏱️ Duração em segundos: $DURACAO_SEGUNDOS"
           
           # Criar script de execução com timeout
-          cat > run_with_timeout.sh << EOF
+          cat > run_with_timeout.sh << 'EOF'
           #!/bin/bash
 
-          DURACAO=\$1
+          DURACAO=$1
           LOG_FILE="bot_execution.log"
 
           echo "🎬 Iniciando execução do bot..."
@@ -405,7 +414,7 @@ except Exception as e:
           echo "─────────────────────────────────────────"
 
           exit 0
-          SCRIPT_EOF
+          EOF
           
           chmod +x run_with_timeout.sh
           
@@ -498,7 +507,7 @@ except Exception as e:
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d "{\"message\":\"$MESSAGE\",\"content\":\"$BASE64_CONTENT\"}"
+              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'"}'
           else
             echo "✅ SHA obtido: ${SHA:0:7}..."
             MESSAGE="📄 Bot atualizado automaticamente - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
@@ -508,7 +517,7 @@ except Exception as e:
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d "{\"message\":\"$MESSAGE\",\"content\":\"$BASE64_CONTENT\",\"sha\":\"$SHA\"}"
+              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'","sha":"'"$SHA"'"}'
           fi
           
           echo "✅ Upload concluído!"
@@ -517,15 +526,15 @@ except Exception as e:
         if: always()
         run: |
           echo ""
-          echo "╔═══════════════════════════════════════╗"
+          echo "╔════════════════════════════════════════╗"
           echo "📋 RESUMO DA EXECUÇÃO"
-          echo "╚═══════════════════════════════════════╝"
+          echo "╚════════════════════════════════════════╝"
           echo "📅 Data/Hora: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
           echo "⏱️ Duração configurada: ${{ github.event.inputs.duracao_horas || '11' }} horas"
           echo "🔄 Próxima execução: Em ~12 horas"
-          echo "╔═══════════════════════════════════════╗"
+          echo "╔════════════════════════════════════════╗"
           echo "✅ Workflow concluído com sucesso!"
-          echo "╚═══════════════════════════════════════╝"
+          echo "╚════════════════════════════════════════╝"
       
       - name: 🧹 Limpeza de Arquivos Temporários
         if: always()
