@@ -67,14 +67,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GHTOKEN }}
         run: |
           echo "📥 Baixando bot.zip..."
+          echo "🔗 URL configurada"
           
-          # Baixar bot.zip usando o token do GitHub
-          curl -L \
+          # Método 1: Tentar download direto com curl
+          echo "🔄 Tentando método 1: curl..."
+          HTTP_CODE=$(curl -L -w "%{http_code}" \
             -H "Accept: application/vnd.github.raw" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$BOT_URL" \
-            -o bot.zip
+            -o bot.zip)
+          
+          echo "📡 HTTP Status Code: $HTTP_CODE"
           
           # Verificar se o download foi bem-sucedido
           if [ ! -f bot.zip ]; then
@@ -83,11 +87,63 @@ jobs:
           fi
           
           # Verificar tamanho do arquivo
-          BOT_SIZE=$(stat -f%z bot.zip 2>/dev/null || stat -c%s bot.zip 2>/dev/null)
-          echo "📊 Tamanho do bot.zip: $BOT_SIZE bytes"
+          BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
+          echo "📊 Tamanho do bot.zip: $BOT_SIZE bytes ($(echo "scale=2; $BOT_SIZE / 1024 / 1024" | bc 2>/dev/null || echo "?") MB)"
           
+          # Verificar tipo do arquivo
+          echo "🔍 Tipo do arquivo:"
+          file bot.zip
+          
+          # Se o arquivo for muito pequeno ou não for ZIP, tentar método alternativo
+          if [ "$BOT_SIZE" -lt 1000 ] || ! file bot.zip | grep -q "Zip archive"; then
+            echo "⚠️ Arquivo inválido, tentando método 2: download via API..."
+            
+            # Extrair owner, repo e path da URL
+            if [[ "$BOT_URL" =~ github\.com/repos/([^/]+)/([^/]+)/contents/(.+) ]]; then
+              OWNER="${BASH_REMATCH[1]}"
+              REPO="${BASH_REMATCH[2]}"
+              FILE_PATH="${BASH_REMATCH[3]}"
+              
+              echo "📦 Owner: $OWNER"
+              echo "📦 Repo: $REPO"
+              echo "📦 File: $FILE_PATH"
+              
+              # Baixar via API e extrair conteúdo base64
+              curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/$OWNER/$REPO/contents/$FILE_PATH" \
+                | python3 -c "import sys, json, base64; data=json.load(sys.stdin); open('bot.zip', 'wb').write(base64.b64decode(data['content']))"
+              
+              BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
+              echo "📊 Novo tamanho: $BOT_SIZE bytes"
+            else
+              echo "❌ Não foi possível extrair informações da URL"
+            fi
+          fi
+          
+          # Verificação final
           if [ "$BOT_SIZE" -lt 1000 ]; then
             echo "❌ Erro: bot.zip muito pequeno, pode estar corrompido!"
+            echo "📄 Conteúdo do arquivo:"
+            head -c 500 bot.zip
+            exit 1
+          fi
+          
+          # Verificar se é realmente um ZIP
+          if ! file bot.zip | grep -q "Zip archive"; then
+            echo "⚠️ ATENÇÃO: O arquivo não parece ser um ZIP válido!"
+            echo "📄 Primeiros 100 bytes do arquivo (hex):"
+            hexdump -C bot.zip | head -10
+            echo "📄 Primeiros 100 bytes do arquivo (texto):"
+            head -c 100 bot.zip
+            exit 1
+          fi
+          
+          # Testar integridade do ZIP
+          echo "🧪 Testando integridade do arquivo ZIP..."
+          if unzip -t bot.zip; then
+            echo "✅ bot.zip é válido e íntegro!"
+          else
+            echo "❌ bot.zip está corrompido ou inválido!"
             exit 1
           fi
           
@@ -97,15 +153,46 @@ jobs:
         run: |
           echo "📂 Extraindo bot.zip..."
           
+          # Verificar novamente se bot.zip existe
+          if [ ! -f bot.zip ]; then
+            echo "❌ Erro: bot.zip não encontrado!"
+            ls -la
+            exit 1
+          fi
+          
+          # Verificar tipo antes de extrair
+          echo "🔍 Verificando tipo do arquivo:"
+          file bot.zip
+          
           # Criar diretório de trabalho
           mkdir -p bot_workspace
           
-          # Extrair bot.zip
-          unzip -q bot.zip -d bot_workspace
+          # Extrair bot.zip com verbose
+          echo "📦 Extraindo arquivos..."
+          if unzip -q bot.zip -d bot_workspace; then
+            echo "✅ Extração bem-sucedida!"
+          else
+            echo "❌ Erro ao extrair bot.zip!"
+            echo "📊 Informações do arquivo:"
+            ls -lh bot.zip
+            file bot.zip
+            echo "📄 Tentando listar conteúdo do ZIP:"
+            unzip -l bot.zip || true
+            exit 1
+          fi
           
           # Verificar se a extração foi bem-sucedida
           if [ ! -d bot_workspace ]; then
-            echo "❌ Erro: Falha ao extrair bot.zip!"
+            echo "❌ Erro: Diretório bot_workspace não foi criado!"
+            exit 1
+          fi
+          
+          # Verificar se há arquivos no diretório
+          FILE_COUNT=$(find bot_workspace -type f | wc -l)
+          echo "📊 Arquivos extraídos: $FILE_COUNT"
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️ ATENÇÃO: Nenhum arquivo foi extraído!"
             exit 1
           fi
           
