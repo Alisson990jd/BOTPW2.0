@@ -18,6 +18,7 @@ env:
   REPO_OWNER: Alisson990jd
   REPO_NAME: apiss
   BOT_ZIP: bot.zip
+  BOT_BRANCH: main  # ou master, dependendo da sua branch principal
 
 jobs:
   executar-bot:
@@ -63,91 +64,165 @@ jobs:
       
       - name: 📥 Baixar bot.zip do repositório
         env:
-          BOT_URL: ${{ secrets.BOT }}
           GH_TOKEN: ${{ secrets.GHTOKEN }}
         run: |
-          echo "📥 Baixando bot.zip..."
-          echo "🔗 URL configurada"
+          echo "📥 Baixando bot.zip do repositório..."
           
-          # Método 1: Tentar download direto com curl
-          echo "🔄 Tentando método 1: curl..."
-          HTTP_CODE=$(curl -L -w "%{http_code}" \
-            -H "Accept: application/vnd.github.raw" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$BOT_URL" \
+          # Usar as variáveis de ambiente do repositório
+          OWNER="$REPO_OWNER"
+          REPO="$REPO_NAME"
+          FILE="bot.zip"
+          
+          echo "📦 Repositório: $OWNER/$REPO"
+          echo "📄 Arquivo: $FILE"
+          
+          # Método 1: Tentar download direto via raw.githubusercontent.com
+          echo ""
+          echo "🔄 Método 1: Download direto (raw.githubusercontent.com)..."
+          
+          # Tentar branch main
+          RAW_URL="https://raw.githubusercontent.com/$OWNER/$REPO/main/$FILE"
+          echo "🔗 Tentando: $RAW_URL"
+          
+          HTTP_CODE=$(curl -L -w "%{http_code}" -s \
+            -H "Authorization: token $GH_TOKEN" \
+            "$RAW_URL" \
             -o bot.zip)
           
-          echo "📡 HTTP Status Code: $HTTP_CODE"
+          echo "📡 HTTP Status: $HTTP_CODE"
           
-          # Verificar se o download foi bem-sucedido
+          # Se falhar, tentar branch master
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Falhou na branch main, tentando master..."
+            RAW_URL="https://raw.githubusercontent.com/$OWNER/$REPO/master/$FILE"
+            echo "🔗 Tentando: $RAW_URL"
+            
+            HTTP_CODE=$(curl -L -w "%{http_code}" -s \
+              -H "Authorization: token $GH_TOKEN" \
+              "$RAW_URL" \
+              -o bot.zip)
+            
+            echo "📡 HTTP Status: $HTTP_CODE"
+          fi
+          
+          # Verificar se o arquivo foi baixado corretamente
+          if [ -f bot.zip ]; then
+            BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
+            echo "📊 Tamanho: $BOT_SIZE bytes"
+            
+            # Verificar se é um ZIP válido
+            if file bot.zip | grep -q "Zip archive"; then
+              echo "✅ Método 1 bem-sucedido!"
+            else
+              echo "⚠️ Método 1 baixou arquivo inválido, tentando método 2..."
+              rm -f bot.zip
+              HTTP_CODE="000"
+            fi
+          fi
+          
+          # Método 2: Download via GitHub API
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo ""
+            echo "🔄 Método 2: Download via API do GitHub..."
+            
+            # Tentar branch main
+            API_URL="https://api.github.com/repos/$OWNER/$REPO/contents/$FILE"
+            echo "🔗 Tentando: $API_URL"
+            
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "$API_URL")
+            
+            # Verificar se obteve resposta válida
+            if echo "$RESPONSE" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+              echo "📦 Decodificando conteúdo base64..."
+              echo "$RESPONSE" | python3 -c "
+import sys, json, base64
+try:
+    data = json.load(sys.stdin)
+    if 'content' in data:
+        content = base64.b64decode(data['content'])
+        with open('bot.zip', 'wb') as f:
+            f.write(content)
+        print('✅ Arquivo decodificado com sucesso!')
+    else:
+        print('❌ Resposta da API não contém campo content')
+        print('Resposta:', json.dumps(data, indent=2)[:500])
+        sys.exit(1)
+except Exception as e:
+    print(f'❌ Erro ao processar resposta: {e}')
+    sys.exit(1)
+"
+              
+              if [ $? -eq 0 ] && [ -f bot.zip ]; then
+                BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
+                echo "📊 Tamanho: $BOT_SIZE bytes"
+                
+                if file bot.zip | grep -q "Zip archive"; then
+                  echo "✅ Método 2 bem-sucedido!"
+                else
+                  echo "❌ Método 2 baixou arquivo inválido"
+                fi
+              fi
+            else
+              echo "❌ Resposta da API inválida"
+              echo "Resposta: ${RESPONSE:0:500}"
+            fi
+          fi
+          
+          # Verificação final
+          echo ""
+          echo "🔍 Verificação final..."
+          
           if [ ! -f bot.zip ]; then
-            echo "❌ Erro: bot.zip não foi baixado!"
+            echo "❌ ERRO: bot.zip não foi baixado!"
+            echo ""
+            echo "💡 Possíveis soluções:"
+            echo "   1. Verifique se o arquivo bot.zip existe no repositório $OWNER/$REPO"
+            echo "   2. Verifique se o token GHTOKEN tem permissões de leitura"
+            echo "   3. Verifique se o arquivo está na branch main ou master"
+            echo ""
+            echo "🔗 Verifique manualmente em:"
+            echo "   https://github.com/$OWNER/$REPO/blob/main/bot.zip"
             exit 1
           fi
           
-          # Verificar tamanho do arquivo
           BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
-          echo "📊 Tamanho do bot.zip: $BOT_SIZE bytes ($(echo "scale=2; $BOT_SIZE / 1024 / 1024" | bc 2>/dev/null || echo "?") MB)"
+          echo "📊 Tamanho final: $BOT_SIZE bytes ($(echo "scale=2; $BOT_SIZE / 1024 / 1024" | bc 2>/dev/null || echo "?") MB)"
           
           # Verificar tipo do arquivo
           echo "🔍 Tipo do arquivo:"
           file bot.zip
           
-          # Se o arquivo for muito pequeno ou não for ZIP, tentar método alternativo
-          if [ "$BOT_SIZE" -lt 1000 ] || ! file bot.zip | grep -q "Zip archive"; then
-            echo "⚠️ Arquivo inválido, tentando método 2: download via API..."
-            
-            # Extrair owner, repo e path da URL
-            if [[ "$BOT_URL" =~ github\.com/repos/([^/]+)/([^/]+)/contents/(.+) ]]; then
-              OWNER="${BASH_REMATCH[1]}"
-              REPO="${BASH_REMATCH[2]}"
-              FILE_PATH="${BASH_REMATCH[3]}"
-              
-              echo "📦 Owner: $OWNER"
-              echo "📦 Repo: $REPO"
-              echo "📦 File: $FILE_PATH"
-              
-              # Baixar via API e extrair conteúdo base64
-              curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/$OWNER/$REPO/contents/$FILE_PATH" \
-                | python3 -c "import sys, json, base64; data=json.load(sys.stdin); open('bot.zip', 'wb').write(base64.b64decode(data['content']))"
-              
-              BOT_SIZE=$(stat -c%s bot.zip 2>/dev/null || stat -f%z bot.zip 2>/dev/null)
-              echo "📊 Novo tamanho: $BOT_SIZE bytes"
-            else
-              echo "❌ Não foi possível extrair informações da URL"
-            fi
-          fi
-          
-          # Verificação final
-          if [ "$BOT_SIZE" -lt 1000 ]; then
-            echo "❌ Erro: bot.zip muito pequeno, pode estar corrompido!"
-            echo "📄 Conteúdo do arquivo:"
-            head -c 500 bot.zip
+          # Verificar se é HTML (erro 404)
+          if file bot.zip | grep -q "HTML"; then
+            echo "❌ ERRO: O arquivo baixado é HTML (provavelmente página de erro 404)"
+            echo "📄 Primeiros 200 caracteres:"
+            head -c 200 bot.zip
             exit 1
           fi
           
           # Verificar se é realmente um ZIP
           if ! file bot.zip | grep -q "Zip archive"; then
-            echo "⚠️ ATENÇÃO: O arquivo não parece ser um ZIP válido!"
-            echo "📄 Primeiros 100 bytes do arquivo (hex):"
-            hexdump -C bot.zip | head -10
-            echo "📄 Primeiros 100 bytes do arquivo (texto):"
-            head -c 100 bot.zip
+            echo "❌ ERRO: O arquivo não é um ZIP válido!"
+            echo "📄 Primeiros bytes (hex):"
+            hexdump -C bot.zip | head -5
             exit 1
           fi
           
           # Testar integridade do ZIP
-          echo "🧪 Testando integridade do arquivo ZIP..."
-          if unzip -t bot.zip; then
+          echo "🧪 Testando integridade..."
+          if unzip -t bot.zip >/dev/null 2>&1; then
             echo "✅ bot.zip é válido e íntegro!"
           else
-            echo "❌ bot.zip está corrompido ou inválido!"
+            echo "❌ ERRO: bot.zip está corrompido!"
+            unzip -t bot.zip
             exit 1
           fi
           
-          echo "✅ bot.zip baixado com sucesso!"
+          echo ""
+          echo "✅ bot.zip baixado e verificado com sucesso!"
       
       - name: 📂 Extrair bot.zip
         run: |
