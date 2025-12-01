@@ -350,10 +350,10 @@ except Exception as e:
           echo "⏱️ Duração em segundos: $DURACAO_SEGUNDOS"
           
           # Criar script de execução com timeout
-          cat > run_with_timeout.sh << 'SCRIPT_EOF'
+          cat > run_with_timeout.sh << EOF
           #!/bin/bash
 
-          DURACAO=$1
+          DURACAO=\$1
           LOG_FILE="bot_execution.log"
 
           echo "🎬 Iniciando execução do bot..."
