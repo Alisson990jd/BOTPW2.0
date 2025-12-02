@@ -485,9 +485,6 @@ jobs:
         run: |
           echo "📤 Fazendo upload do novo bot.zip..."
           
-          # Codificar bot.zip em base64
-          BASE64_CONTENT=$(base64 -w 0 bot.zip)
-          
           # Obter SHA do arquivo atual
           echo "🔍 Obtendo SHA do arquivo atual..."
           SHA_RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -496,28 +493,76 @@ jobs:
           SHA=$(echo "$SHA_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('sha', ''))")
           
           if [ -z "$SHA" ]; then
-            echo "⚠️ Arquivo não existe no repositório, criando novo..."
-            MESSAGE="🤖 Bot atualizado automaticamente - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
-            
-            # Criar arquivo
-            curl -X PUT \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'"}'
+            echo "⚠️ Arquivo não existe, será criado um novo."
           else
             echo "✅ SHA obtido: ${SHA:0:7}..."
-            MESSAGE="📄 Bot atualizado automaticamente - $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
-            
-            # Atualizar arquivo
-            curl -X PUT \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
-              -d '{"message":"'"$MESSAGE"'","content":"'"$BASE64_CONTENT"'","sha":"'"$SHA"'"}'
           fi
           
-          echo "✅ Upload concluído!"
+          # --- CORREÇÃO AQUI ---
+          # Criar script Python para gerar o JSON do payload
+          # Isso evita o erro "Argument list too long" do shell
+          
+          cat > create_payload.py << 'EOF'
+          import sys, json, base64, os
+          
+          file_path = 'bot.zip'
+          sha = sys.argv[1] if len(sys.argv) > 1 else ""
+          message = "🤖 Bot atualizado automaticamente - " + os.environ.get('DATE_MSG', 'update')
+          
+          try:
+              # Ler o arquivo ZIP e codificar em Base64
+              with open(file_path, "rb") as f:
+                  encoded = base64.b64encode(f.read()).decode('utf-8')
+              
+              # Criar o objeto JSON
+              payload = {
+                  "message": message,
+                  "content": encoded
+              }
+              
+              # Adicionar SHA apenas se ele existir (para update)
+              if sha and sha != "None":
+                  payload["sha"] = sha
+              
+              # Salvar em arquivo
+              with open("payload.json", "w") as outfile:
+                  json.dump(payload, outfile)
+              
+              print("✅ Payload JSON criado com sucesso!")
+              
+          except Exception as e:
+              print(f"❌ Erro ao criar payload: {e}")
+              sys.exit(1)
+          EOF
+          
+          # Executar o script Python
+          export DATE_MSG="$(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)"
+          python3 create_payload.py "$SHA"
+          
+          # Fazer upload usando curl lendo o arquivo (-d @payload.json)
+          echo "📡 Enviando para API do GitHub..."
+          
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$BOT_ZIP" \
+            -d @payload.json)
+            
+          echo "📡 HTTP Status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "201" ]; then
+            echo "✅ Upload concluído com sucesso!"
+          else
+            echo "❌ Erro no upload!"
+            echo "📄 Resposta da API:"
+            cat response.json
+            exit 1
+          fi
+          
+          # Limpar arquivos temporários
+          rm payload.json create_payload.py response.json
       
       - name: 📋 Resumo da Execução
         if: always()
