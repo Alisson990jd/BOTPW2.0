@@ -15,9 +15,21 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    if: ${{ github.event.inputs.senha == secrets.SENHA }}
 
     steps:
+      - name: "🔒 Verificar senha"
+        env:
+          SENHA_CORRETA: ${{ secrets.SENHA }}
+          SENHA_INPUT: ${{ github.event.inputs.senha }}
+        run: |
+          if [ "$SENHA_INPUT" != "$SENHA_CORRETA" ]; then
+            echo "╔═══════════════════════════════════╗"
+            echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
+            echo "╚═══════════════════════════════════╝"
+            exit 1
+          fi
+          echo "✅ Senha correta"
+
       - name: Checkout apiss repo
         uses: actions/checkout@v4
         with:
@@ -78,7 +90,6 @@ jobs:
             NOW_EPOCH=$(date -u +%s)
             local COOLDOWN_SECS=$((COOLDOWN_HOURS * 3600))
 
-            # Limpar keys que já passaram o cooldown
             python3 - "$USAGE_FILE" "$NOW_EPOCH" "$COOLDOWN_SECS" <<'PYCLEAN'
           import json, sys
 
@@ -106,7 +117,6 @@ jobs:
               json.dump(data, f, indent=2)
           PYCLEAN
 
-            # Pegar keys em uso ou expiradas
             local BLOCKED_KEYS
             BLOCKED_KEYS=$(python3 - "$USAGE_FILE" <<'PYBLOCK'
           import json, sys
@@ -123,7 +133,6 @@ jobs:
           PYBLOCK
             )
 
-            # Encontrar uma key disponível
             while IFS= read -r KEY; do
               [ -z "$KEY" ] && continue
               KEY=$(echo "$KEY" | tr -d '[:space:]')
@@ -144,7 +153,7 @@ jobs:
             NOW_EPOCH=$(date -u +%s)
 
             python3 - "$USAGE_FILE" "$KEY" "$CHUNK_ID" "$NOW_EPOCH" <<'PYMARK'
-          import json, sys
+          import json, sys, datetime
 
           usage_file = sys.argv[1]
           key = sys.argv[2]
@@ -158,7 +167,7 @@ jobs:
               "key": key,
               "chunk_id": chunk_id,
               "timestamp": timestamp,
-              "date": __import__('datetime').datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+              "date": datetime.datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
           })
 
           with open(usage_file, 'w') as f:
@@ -173,7 +182,7 @@ jobs:
             NOW_EPOCH=$(date -u +%s)
 
             python3 - "$USAGE_FILE" "$KEY" "$REASON" "$NOW_EPOCH" <<'PYEXP'
-          import json, sys
+          import json, sys, datetime
 
           usage_file = sys.argv[1]
           key = sys.argv[2]
@@ -183,15 +192,13 @@ jobs:
           with open(usage_file, 'r') as f:
               data = json.load(f)
 
-          # Remover de used_keys se estiver lá
           data['used_keys'] = [e for e in data['used_keys'] if e.get('key') != key]
 
-          # Adicionar a expired_keys
           data['expired_keys'].append({
               "key": key,
               "reason": reason,
               "timestamp": timestamp,
-              "date": __import__('datetime').datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+              "date": datetime.datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
           })
 
           with open(usage_file, 'w') as f:
@@ -215,12 +222,9 @@ jobs:
           with open(analysis_file, 'r', encoding='utf-8', errors='replace') as f:
               content = f.read()
 
-          # Extrair header (tudo antes do primeiro MINUTO)
           header_match = re.search(r'^(.*?)(?=={10,}\nMINUTO\s+\d+)', content, re.DOTALL)
           header = header_match.group(1).strip() if header_match else ""
 
-          # Encontrar todos os segmentos (MINUTO XXX)
-          # Pattern: bloco que começa com ===...MINUTO e vai até o próximo ===...MINUTO ou fim
           segment_pattern = re.compile(
               r'(={10,}\nMINUTO\s+(\d+)\s*\|[^\n]*\n={10,}\n.*?)(?=\n={10,}\nMINUTO\s+\d+|\n={10,}\nCONCLUIDO|\n={10,}\nANALISE|\Z)',
               re.DOTALL
@@ -233,17 +237,14 @@ jobs:
               seg_text = match.group(1).strip()
               minute_num = int(match.group(2))
 
-              # Evitar duplicatas (mesmo minuto pode aparecer em análises diferentes)
               if minute_num not in seen_minutes:
                   segments.append((minute_num, seg_text))
                   seen_minutes.add(minute_num)
 
-          # Ordenar por número do minuto
           segments.sort(key=lambda x: x[0])
 
-          print(f"Total de segmentos únicos encontrados: {len(segments)}")
+          print(f"Total de segmentos unicos encontrados: {len(segments)}")
 
-          # Dividir em chunks
           os.makedirs(output_dir, exist_ok=True)
           chunk_num = 0
 
@@ -410,7 +411,6 @@ jobs:
             CHUNK_LINES=$(wc -l < "$CHUNK_FILE")
             echo "   📄 $CHUNK_LINES linhas"
 
-            # Loop infinito até conseguir
             ATTEMPT=0
             CHUNK_SUCCESS=false
 
@@ -419,7 +419,6 @@ jobs:
 
               echo "   🔄 Tentativa #$ATTEMPT"
 
-              # Obter key disponível
               API_KEY=$(get_available_key)
 
               if [ -z "$API_KEY" ]; then
@@ -431,17 +430,14 @@ jobs:
               KEY_SHORT="${API_KEY:0:8}...${API_KEY: -4}"
               echo "   🔑 Key: $KEY_SHORT"
 
-              # Marcar key como usada
               mark_key_used "$API_KEY" "$CHUNK_NAME"
 
-              # Commit do usage file para persistir
               git add "$USAGE_FILE" 2>/dev/null
               git diff --cached --quiet 2>/dev/null || {
                 git commit -m "🔄 Key em uso: $CHUNK_NAME" --quiet 2>/dev/null
                 git push --quiet 2>/dev/null
               }
 
-              # Criar venv isolada
               VENV_DIR="tmp_venvs/venv_${CHUNK_NAME}_${ATTEMPT}"
               echo "   📦 Criando venv: $VENV_DIR"
 
@@ -449,10 +445,9 @@ jobs:
               source "$VENV_DIR/bin/activate"
               pip install -q google-genai 2>/dev/null
 
-              # Criar script de análise
               SCRIPT_FILE="tmp_venvs/analyze_${CHUNK_NAME}_${ATTEMPT}.py"
 
-              cat > "$SCRIPT_FILE" <<PYSCRIPT
+              cat > "$SCRIPT_FILE" <<'PYSCRIPT'
           import sys
           import json
           import re
@@ -463,16 +458,14 @@ jobs:
               chunk_file = sys.argv[2]
               output_file = sys.argv[3]
               prompt_file = sys.argv[4]
+              model_name = sys.argv[5]
 
-              # Ler prompt template
               with open(prompt_file, 'r', encoding='utf-8') as f:
                   prompt_template = f.read()
 
-              # Ler chunk
               with open(chunk_file, 'r', encoding='utf-8') as f:
                   chunk_content = f.read()
 
-              # Montar prompt completo
               full_prompt = prompt_template + "\n\n" + chunk_content
 
               try:
@@ -481,7 +474,7 @@ jobs:
                   client = genai.Client(api_key=api_key)
 
                   response = client.models.generate_content(
-                      model="$MODEL",
+                      model=model_name,
                       contents=full_prompt,
                       config={
                           "temperature": 0.3,
@@ -491,29 +484,24 @@ jobs:
 
                   raw_text = response.text.strip()
 
-                  # Limpar markdown code blocks se houver
-                  if raw_text.startswith("\`\`\`"):
+                  if raw_text.startswith("```"):
                       lines = raw_text.split("\n")
-                      # Remover primeira e última linha de code block
-                      if lines[0].startswith("\`\`\`"):
+                      if lines[0].startswith("```"):
                           lines = lines[1:]
-                      if lines and lines[-1].strip() == "\`\`\`":
+                      if lines and lines[-1].strip() == "```":
                           lines = lines[:-1]
                       raw_text = "\n".join(lines).strip()
 
-                  # Tentar parsear JSON
                   parsed = json.loads(raw_text)
 
-                  # Validar estrutura
                   if "clips" not in parsed:
-                      print("ERROR: JSON não contém 'clips'", file=sys.stderr)
+                      print("ERROR: JSON nao contem 'clips'", file=sys.stderr)
                       sys.exit(1)
 
                   if not isinstance(parsed["clips"], list):
-                      print("ERROR: 'clips' não é uma lista", file=sys.stderr)
+                      print("ERROR: 'clips' nao e uma lista", file=sys.stderr)
                       sys.exit(1)
 
-                  # Salvar resultado
                   with open(output_file, 'w', encoding='utf-8') as f:
                       json.dump(parsed, f, indent=2, ensure_ascii=False)
 
@@ -522,10 +510,12 @@ jobs:
 
               except json.JSONDecodeError as e:
                   print(f"ERROR_JSON: {e}", file=sys.stderr)
-                  # Salvar raw para debug
                   debug_file = output_file + ".raw.txt"
-                  with open(debug_file, 'w', encoding='utf-8') as f:
-                      f.write(raw_text if 'raw_text' in dir() else "NO_RESPONSE")
+                  try:
+                      with open(debug_file, 'w', encoding='utf-8') as f:
+                          f.write(raw_text if 'raw_text' in dir() else "NO_RESPONSE")
+                  except:
+                      pass
                   sys.exit(2)
 
               except Exception as e:
@@ -537,19 +527,18 @@ jobs:
               main()
           PYSCRIPT
 
-              # Executar análise
               OUTPUT_JSON="$OUTPUT_DIR/${CHUNK_NAME}.json"
 
-              RESULT=$(python3 "$SCRIPT_FILE" \
+              RESULT=$("$VENV_DIR/bin/python3" "$SCRIPT_FILE" \
                 "$API_KEY" \
                 "$CHUNK_FILE" \
                 "$OUTPUT_JSON" \
                 "tmp_prompt_template.txt" \
+                "$MODEL" \
                 2>&1)
 
               EXIT_CODE=$?
 
-              # Desativar venv
               deactivate 2>/dev/null
 
               if [ $EXIT_CODE -eq 0 ]; then
@@ -559,26 +548,21 @@ jobs:
                 SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 CHUNK_SUCCESS=true
 
-                # Limpar venv
                 rm -rf "$VENV_DIR" "$SCRIPT_FILE"
               else
                 echo "   ❌ Erro (code=$EXIT_CODE): $(echo "$RESULT" | tail -1)"
                 echo "   🔄 Marcando key como expirada e tentando outra..."
 
-                # Marcar key como expirada
                 mark_key_expired "$API_KEY" "error_code_${EXIT_CODE}_chunk_${CHUNK_NAME}"
 
-                # Commit do usage file
                 git add "$USAGE_FILE" 2>/dev/null
                 git diff --cached --quiet 2>/dev/null || {
                   git commit -m "❌ Key expirada: $CHUNK_NAME tentativa $ATTEMPT" --quiet 2>/dev/null
                   git push --quiet 2>/dev/null
                 }
 
-                # Limpar venv com erro
                 rm -rf "$VENV_DIR" "$SCRIPT_FILE"
 
-                # Pequeno delay antes de tentar de novo
                 sleep 5
               fi
             done
@@ -610,7 +594,6 @@ jobs:
               except Exception as e:
                   print(f"  ❌ {os.path.basename(jf)}: {e}")
 
-          # Deduplicar por clip_id
           seen_ids = set()
           unique_clips = []
           for clip in all_clips:
@@ -619,7 +602,6 @@ jobs:
                   seen_ids.add(cid)
                   unique_clips.append(clip)
 
-          # Ordenar por start_time
           def time_to_secs(t):
               try:
                   parts = t.split(':')
@@ -631,25 +613,23 @@ jobs:
 
           final = {"clips": unique_clips}
 
-          # Salvar JSON final
           with open("analise_resultado.json", 'w', encoding='utf-8') as f:
               json.dump(final, f, indent=2, ensure_ascii=False)
 
-          # Estatísticas
           yt = sum(1 for c in unique_clips if c.get('platform') in ('youtube', 'both'))
           tt = sum(1 for c in unique_clips if c.get('platform') in ('tiktok', 'both'))
           total_dur = sum(c.get('duration_seconds', 0) for c in unique_clips)
 
           print(f"\n{'='*50}")
-          print(f"  Total de clips únicos: {len(unique_clips)}")
+          print(f"  Total de clips unicos: {len(unique_clips)}")
           print(f"  YouTube/Both: {yt}")
           print(f"  TikTok/Both: {tt}")
-          print(f"  Duração total: {total_dur//3600}h{(total_dur%3600)//60}m")
+          print(f"  Duracao total: {total_dur//3600}h{(total_dur%3600)//60}m")
           print(f"{'='*50}")
           PYMERGE
 
           ##############################################################
-          # GERAR RELATÓRIO TXT LEGÍVEL
+          # GERAR RELATÓRIO TXT
           ##############################################################
           python3 - <<'PYREPORT'
           import json
@@ -675,12 +655,12 @@ jobs:
                   f.write("🎥 CLIPES PARA YOUTUBE\n")
                   f.write("-" * 60 + "\n\n")
                   for i, c in enumerate(yt_clips, 1):
-                      f.write(f"  [{i}] {c.get('title', 'Sem título')}\n")
+                      f.write(f"  [{i}] {c.get('title', 'Sem titulo')}\n")
                       f.write(f"      ⏱️  {c.get('start_time')} → {c.get('end_time')} ({c.get('duration_seconds', 0)}s)\n")
                       f.write(f"      📂 {c.get('category', '?')}\n")
                       f.write(f"      💡 {c.get('reason', '')}\n")
                       f.write(f"      🏷️  {', '.join(c.get('tags', []))}\n")
-                      f.write(f"      💰 Monetizável: {'✅' if c.get('monetizable') else '❌'}\n")
+                      f.write(f"      💰 Monetizavel: {'✅' if c.get('monetizable') else '❌'}\n")
                       flags = c.get('safety_flags', [])
                       if flags:
                           f.write(f"      ⚠️  Flags: {', '.join(flags)}\n")
@@ -693,17 +673,17 @@ jobs:
                   f.write("\n📱 CLIPES PARA TIKTOK\n")
                   f.write("-" * 60 + "\n\n")
                   for i, c in enumerate(tt_clips, 1):
-                      f.write(f"  [{i}] {c.get('title', 'Sem título')}\n")
+                      f.write(f"  [{i}] {c.get('title', 'Sem titulo')}\n")
                       f.write(f"      ⏱️  {c.get('start_time')} → {c.get('end_time')} ({c.get('duration_seconds', 0)}s)\n")
                       f.write(f"      📂 {c.get('category', '?')}\n")
                       f.write(f"      💡 {c.get('reason', '')}\n")
                       f.write(f"      🏷️  {', '.join(c.get('tags', []))}\n")
-                      f.write(f"      💰 Monetizável: {'✅' if c.get('monetizable') else '❌'}\n")
+                      f.write(f"      💰 Monetizavel: {'✅' if c.get('monetizable') else '❌'}\n")
                       f.write(f"      📝 {c.get('recommended_description', '')}\n")
                       f.write(f"      🖼️  Thumbnail: \"{c.get('thumbnail_text', '')}\" @ {c.get('thumbnail_timestamp', '')}\n")
                       f.write("\n")
 
-          print("📄 Relatório TXT gerado: analise_resultado.txt")
+          print("📄 Relatorio TXT gerado: analise_resultado.txt")
           PYREPORT
 
           ##############################################################
@@ -717,7 +697,6 @@ jobs:
           echo "║  Total de clips:     $TOTAL_CLIPS"
           echo "╚══════════════════════════════════════════════════╝"
 
-          # Limpar temporários
           rm -rf tmp_chunks tmp_venvs tmp_prompt_template.txt
 
       - name: Commit resultados
@@ -738,14 +717,3 @@ jobs:
             analise_resultado.json
             analise_resultado.txt
           retention-days: 30
-
-  senha-errada:
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.senha != secrets.SENHA }}
-    steps:
-      - name: "🚫 Acesso negado"
-        run: |
-          echo "╔═══════════════════════════════════╗"
-          echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
-          echo "╚═══════════════════════════════════╝"
-          exit 1
