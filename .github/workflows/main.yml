@@ -2,8 +2,11 @@ name: "⚡ Reset Gemini API Keys (TURBO)"
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"
+    inputs:
+      senha:
+        description: "🔒 Digite a senha para executar"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +15,7 @@ jobs:
   reset-keys:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    if: ${{ github.event.inputs.senha == secrets.SENHA }}
 
     steps:
       - name: Checkout apiss repo
@@ -30,13 +34,11 @@ jobs:
           W="$( mktemp -d )"
           mkdir -p "$W"/{results,keys,logs,queue}
 
-          # ── Funções no script do worker ──
           cat > "$W/worker.sh" <<'WRK'
           #!/bin/bash
           set +e
           TOKEN="$1"; PROJECT="$2"; RESULT="$3"; KEYF="$4"; ACCOUNT="$5"
 
-          # Habilitar APIs (fire-and-forget, sem esperar)
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://serviceusage.googleapis.com/v1/projects/${PROJECT}/services/apikeys.googleapis.com:enable" -d'{}' &>/dev/null &
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -44,14 +46,12 @@ jobs:
           wait
           sleep 3
 
-          # Listar TODAS as keys (uma chamada só)
           KEYS=$(curl -sS -m15 -H "Authorization: Bearer $TOKEN" \
             "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=500" 2>/dev/null \
             | jq -r '.keys[]?.name // empty')
 
           DEL=0
           if [ -n "$KEYS" ]; then
-            # Deletar TODAS em paralelo (fire-and-forget)
             while IFS= read -r K; do
               [ -z "$K" ] && continue
               curl -sS -m10 -X DELETE -H "Authorization: Bearer $TOKEN" \
@@ -62,7 +62,6 @@ jobs:
             sleep 2
           fi
 
-          # Criar nova key
           RESP=$(curl -sS -m20 -X POST \
             -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys" \
@@ -72,7 +71,6 @@ jobs:
 
           API_KEY=""
           if [ -n "$OP" ]; then
-            # Poll rápido
             for i in $(seq 1 15); do
               sleep 2
               R=$(curl -sS -m10 -H "Authorization: Bearer $TOKEN" \
@@ -100,10 +98,6 @@ jobs:
           WRK
           chmod +x "$W/worker.sh"
 
-          # ══════════════════════════════════════════
-          #  Coletar tokens + projetos
-          # ══════════════════════════════════════════
-
           if [ ! -d "tokens" ]; then
             echo "❌ Pasta tokens/ não encontrada"; ls -la; exit 1
           fi
@@ -119,24 +113,22 @@ jobs:
             ACCOUNT=$(basename "$TF" .json)
             ACCT=$((ACCT+1))
 
-            # Refresh token
             RT=$(jq -r '.refresh_token//empty' "$TF")
             CI=$(jq -r '.client_id//empty' "$TF")
             CS=$(jq -r '.client_secret//empty' "$TF")
             TU=$(jq -r '.token_uri//"https://oauth2.googleapis.com/token"' "$TF")
 
-            [ -z "$RT" ] || [ -z "$CI" ] || [ -z "$CS" ] && echo "⚠️ Skip $ACCOUNT (dados incompletos)" && continue
+            [ -z "$RT" ] || [ -z "$CI" ] || [ -z "$CS" ] && echo "⚠️ Skip $ACCOUNT" && continue
 
             AT=$(curl -sS -m15 -X POST "$TU" \
               -d "client_id=${CI}&client_secret=${CS}&refresh_token=${RT}&grant_type=refresh_token" 2>/dev/null \
               | jq -r '.access_token//empty')
 
             [ -z "$AT" ] && echo "❌ Auth falhou: $ACCOUNT" && continue
-            echo "✅ [$ACCT] $ACCOUNT autenticado"
+            echo "✅ [$ACCT] $ACCOUNT"
 
             echo "$AT" > "$W/${ACCOUNT}.tok"
 
-            # Listar projetos (com paginação rápida)
             PT=""
             URL="https://cloudresourcemanager.googleapis.com/v1/projects?filter=lifecycleState%3AACTIVE&pageSize=500"
             while true; do
@@ -151,8 +143,6 @@ jobs:
               PT=$(echo "$PR" | jq -r '.nextPageToken//empty')
               [ -z "$PT" ] && break
             done
-
-            echo "   📊 Projetos enfileirados para $ACCOUNT"
           done
 
           echo ""
@@ -161,12 +151,8 @@ jobs:
 
           [ "$TASK" -eq 0 ] && echo "Nenhum projeto" && echo "vazio" > gemini_keys.txt && > gemini_keys_only.txt && exit 0
 
-          # ══════════════════════════════════════════
-          #  Disparar workers (pool de N)
-          # ══════════════════════════════════════════
-
           RUNNING=0
-          DONE=0
+          DONE_COUNT=0
           declare -A PIDS
 
           for TF in $(ls "$W/queue/" | sort -V); do
@@ -176,42 +162,34 @@ jobs:
             T=$(cat "$W/${A}.tok")
             N=$(echo "$TF" | sed 's/t_//')
 
-            # Esperar vaga
             while [ $RUNNING -ge $MAX_WORKERS ]; do
               for pid in "${!PIDS[@]}"; do
                 if ! kill -0 "$pid" 2>/dev/null; then
                   wait "$pid" 2>/dev/null
                   unset PIDS[$pid]
                   RUNNING=$((RUNNING-1))
-                  DONE=$((DONE+1))
+                  DONE_COUNT=$((DONE_COUNT+1))
                 fi
               done
               [ $RUNNING -ge $MAX_WORKERS ] && sleep 0.5
             done
 
-            # Lançar
             bash "$W/worker.sh" "$T" "$P" "$W/results/r_${N}" "$W/keys/k_${N}" "$A" &
             PIDS[$!]=1
             RUNNING=$((RUNNING+1))
 
-            # Progresso a cada 10
-            if [ $((DONE % 10)) -eq 0 ] && [ $DONE -gt 0 ]; then
-              echo "  ⚡ $DONE/$TASK concluídos ($RUNNING ativos)"
+            if [ $((DONE_COUNT % 10)) -eq 0 ] && [ $DONE_COUNT -gt 0 ]; then
+              echo "  ⚡ $DONE_COUNT/$TASK concluídos ($RUNNING ativos)"
             fi
           done
 
-          # Esperar restantes
           for pid in "${!PIDS[@]}"; do
             wait "$pid" 2>/dev/null
-            DONE=$((DONE+1))
+            DONE_COUNT=$((DONE_COUNT+1))
           done
 
-          echo "✅ $DONE/$TASK projetos processados!"
+          echo "✅ $DONE_COUNT/$TASK processados!"
           echo ""
-
-          # ══════════════════════════════════════════
-          #  Montar resultado
-          # ══════════════════════════════════════════
 
           CREATED=0; DELETED=0; ERRORS=0
 
@@ -250,7 +228,6 @@ jobs:
             fi
           done
 
-          # Keys extras dos arquivos individuais
           for KF in "$W/keys"/k_*; do
             [ ! -s "$KF" ] && continue
             KV=$(cat "$KF")
@@ -285,3 +262,14 @@ jobs:
           K=$(wc -l < gemini_keys_only.txt)
           git commit -m "⚡ $K keys - $(date -u '+%H:%M UTC')"
           git push
+
+  senha-errada:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.senha != secrets.SENHA }}
+    steps:
+      - name: "🚫 Acesso negado"
+        run: |
+          echo "╔═══════════════════════════════════╗"
+          echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
+          echo "╚═══════════════════════════════════╝"
+          exit 1
