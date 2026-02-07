@@ -1,4 +1,4 @@
-name: "🔑 Reset Gemini API Keys (Parallel)"
+name: "ߔ Reset Gemini API Keys (Parallel)"
 
 on:
   workflow_dispatch:
@@ -23,10 +23,10 @@ jobs:
 
       - name: Debug - listar arquivos
         run: |
-          echo "📂 Raiz:"
+          echo "ߓ Raiz:"
           ls -la
           echo ""
-          echo "📂 tokens/:"
+          echo "ߓ tokens/:"
           ls -la tokens/ 2>/dev/null || echo "NÃO encontrada"
 
       - name: Reset all Gemini API Keys (5 workers)
@@ -206,8 +206,8 @@ jobs:
 
           exec > >(tee -a "$LOG_FILE") 2>&1
 
-          echo "  ┌─ 📁 [$ACCOUNT] Projeto: $PROJECT_ID"
-          echo "  │  🔧 Habilitando APIs..."
+          echo "  ┌─ ߓ [$ACCOUNT] Projeto: $PROJECT_ID"
+          echo "  │  ߔ Habilitando APIs..."
 
           enable_api "$ACCESS_TOKEN" "$PROJECT_ID" "apikeys.googleapis.com"
           enable_api "$ACCESS_TOKEN" "$PROJECT_ID" "generativelanguage.googleapis.com"
@@ -216,7 +216,7 @@ jobs:
           sleep "$ENABLE_API_WAIT"
 
           # ── Listar keys existentes ──
-          echo "  │  📋 Listando keys existentes..."
+          echo "  │  ߓ Listando keys existentes..."
           KEYS_RESP=$(curl -sS --max-time 30 \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
             "https://apikeys.googleapis.com/v2/projects/${PROJECT_ID}/locations/global/keys?pageSize=300" 2>/dev/null)
@@ -226,7 +226,7 @@ jobs:
 
           if [ -n "$KEY_NAMES" ]; then
             KEY_COUNT=$(echo "$KEY_NAMES" | wc -l)
-            echo "  │  🔍 $KEY_COUNT keys encontradas"
+            echo "  │  ߔ $KEY_COUNT keys encontradas"
 
             while IFS= read -r KEY_NAME; do
               [ -z "$KEY_NAME" ] && continue
@@ -250,7 +250,7 @@ jobs:
               ')
 
               if [ "$TARGET_TYPE" = "gemini" ] || [ "$TARGET_TYPE" = "unrestricted" ]; then
-                echo "  │  🗑️  Deletando [$TARGET_TYPE]: $KEY_DISPLAY"
+                echo "  │  ߗ️  Deletando [$TARGET_TYPE]: $KEY_DISPLAY"
                 delete_api_key "$ACCESS_TOKEN" "$KEY_NAME"
                 DELETED=$((DELETED + 1))
                 sleep "$RATE_LIMIT_SLEEP"
@@ -259,11 +259,11 @@ jobs:
               fi
             done <<< "$KEY_NAMES"
           else
-            echo "  │  📭 Nenhuma key existente"
+            echo "  │  ߓ Nenhuma key existente"
           fi
 
           # ── Criar nova key ──
-          echo "  │  🔑 Criando nova Gemini API key..."
+          echo "  │  ߔ Criando nova Gemini API key..."
           NEW_KEY=$(create_gemini_key "$ACCESS_TOKEN" "$PROJECT_ID")
 
           if [ -n "$NEW_KEY" ]; then
@@ -298,8 +298,8 @@ jobs:
           fi
 
           FILE_COUNT=$(echo "$TOKEN_FILES" | wc -l)
-          echo "📂 Encontrados $FILE_COUNT arquivos de token"
-          echo "🔧 Workers paralelos: $MAX_WORKERS"
+          echo "ߓ Encontrados $FILE_COUNT arquivos de token"
+          echo "ߔ Workers paralelos: $MAX_WORKERS"
           echo ""
 
           # ══════════════════════════════════════════
@@ -323,10 +323,10 @@ jobs:
 
             echo ""
             echo "╔══════════════════════════════════════════"
-            echo "║ 📧 Conta #${TOTAL_ACCOUNTS}: $ACCOUNT"
+            echo "║ ߓ Conta #${TOTAL_ACCOUNTS}: $ACCOUNT"
             echo "╚══════════════════════════════════════════"
 
-            echo "  🔄 Refreshing access token..."
+            echo "  ߔ Refreshing access token..."
             ACCESS_TOKEN=$(refresh_access_token "$TOKEN_FILE")
 
             if [ -z "$ACCESS_TOKEN" ]; then
@@ -339,13 +339,13 @@ jobs:
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               "https://www.googleapis.com/oauth2/v2/userinfo" 2>/dev/null \
               | jq -r '.email // "desconhecido"')
-            echo "  📧 Email: $USER_EMAIL"
+            echo "  ߓ Email: $USER_EMAIL"
 
             # Guardar token
             echo "$ACCESS_TOKEN" > "$WORK_DIR/${ACCOUNT}.token"
 
             # Listar projetos
-            echo "  📁 Listando projetos..."
+            echo "  ߓ Listando projetos..."
             ALL_PROJECTS=""
             PAGE_TOKEN=""
 
@@ -374,7 +374,7 @@ jobs:
             fi
 
             PROJ_COUNT=$(echo "$ALL_PROJECTS" | wc -l)
-            echo "  📊 $PROJ_COUNT projetos"
+            echo "  ߓ $PROJ_COUNT projetos"
 
             # Criar tarefas na fila
             while IFS= read -r PROJECT_ID; do
@@ -453,7 +453,7 @@ jobs:
                   unset WORKER_PIDS["$pid"]
                   ACTIVE_WORKERS=$((ACTIVE_WORKERS - 1))
                   COMPLETED=$((COMPLETED + 1))
-                  echo "  📊 Progresso: $COMPLETED/$TOTAL_TASKS concluídos ($ACTIVE_WORKERS workers ativos)"
+                  echo "  ߓ Progresso: $COMPLETED/$TOTAL_TASKS concluídos ($ACTIVE_WORKERS workers ativos)"
                 fi
               done
               [ $ACTIVE_WORKERS -ge $MAX_WORKERS ] && sleep 2
@@ -463,7 +463,7 @@ jobs:
             TASK_DATA=$(cat "$TASK_FILE")
             TASK_ACCOUNT=$(echo "$TASK_DATA" | cut -d'|' -f1)
             TASK_PROJECT=$(echo "$TASK_DATA" | cut -d'|' -f2)
-            echo "  🚀 [$TASK_NUM/$TOTAL_TASKS] Lançando: $TASK_ACCOUNT → $TASK_PROJECT"
+            echo "  ߚ [$TASK_NUM/$TOTAL_TASKS] Lançando: $TASK_ACCOUNT → $TASK_PROJECT"
 
             PID=$(process_task "$TASK_FILE" "$TASK_NUM")
             WORKER_PIDS["$PID"]=1
@@ -479,7 +479,7 @@ jobs:
           for pid in "${!WORKER_PIDS[@]}"; do
             wait "$pid" 2>/dev/null
             COMPLETED=$((COMPLETED + 1))
-            echo "  📊 Progresso: $COMPLETED/$TOTAL_TASKS concluídos"
+            echo "  ߓ Progresso: $COMPLETED/$TOTAL_TASKS concluídos"
           done
 
           echo ""
@@ -535,7 +535,7 @@ jobs:
               {
                 echo ""
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                echo "📧 Conta: $R_ACCOUNT"
+                echo "ߓ Conta: $R_ACCOUNT"
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
               } >> "$OUTPUT"
             fi
@@ -572,4 +572,43 @@ jobs:
             echo "║  Keys criadas:        $TOTAL_CREATED"
             echo "║  Erros:               $TOTAL_ERRORS"
             echo "║  Workers paralelos:   $MAX_WORKERS"
-            echo "║  Gerado em:       
+            echo "║  Gerado em:           $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "╚══════════════════════════════════════════════════╝"
+          } >> "$OUTPUT"
+
+          echo ""
+          echo "══════════════════════════════════════════"
+          echo "ߓ RESUMO FINAL"
+          echo "══════════════════════════════════════════"
+          echo "  Contas:    $TOTAL_ACCOUNTS"
+          echo "  Projetos:  $TOTAL_TASKS"
+          echo "  Deletadas: $TOTAL_DELETED"
+          echo "  Criadas:   $TOTAL_CREATED"
+          echo "  Erros:     $TOTAL_ERRORS"
+          echo "  Workers:   $MAX_WORKERS"
+          echo "══════════════════════════════════════════"
+          echo ""
+          echo "ߓ Arquivo de keys:"
+          cat "$OUTPUT"
+          echo ""
+          echo "ߓ Keys (raw):"
+          cat "$KEYS_ONLY"
+
+          # Cleanup
+          rm -rf "$WORK_DIR"
+
+      - name: Commit and push keys
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add gemini_keys.txt gemini_keys_only.txt
+
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteração"
+          else
+            TOTAL=$(wc -l < gemini_keys_only.txt 2>/dev/null || echo 0)
+            git commit -m "ߔ Keys resetadas (5 workers) - $(date -u '+%Y-%m-%d %H:%M UTC') | $TOTAL keys"
+            git push
+            echo "✅ Push realizado!"
+          fi
