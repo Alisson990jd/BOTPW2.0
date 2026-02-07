@@ -37,8 +37,7 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           ref: main
 
-      - name: "🔒 Carregar keys protegidas (cooldown 48h)"
-        id: protected
+      - name: "🔒 Carregar projetos protegidos (cooldown 48h)"
         shell: bash
         run: |
           USAGE_FILE="key_usage.json"
@@ -47,7 +46,7 @@ jobs:
             NOW_EPOCH=$(date -u +%s)
             COOLDOWN_SECS=$((48 * 3600))
 
-            PROTECTED_PROJECTS=$(python3 - "$USAGE_FILE" "$NOW_EPOCH" "$COOLDOWN_SECS" <<'PYPROT'
+            python3 - "$USAGE_FILE" "$NOW_EPOCH" "$COOLDOWN_SECS" <<'PYPROT'
           import json, sys
 
           usage_file = sys.argv[1]
@@ -58,35 +57,36 @@ jobs:
               with open(usage_file, 'r') as f:
                   data = json.load(f)
           except:
-              sys.exit(0)
+              data = {"used_keys": [], "expired_keys": []}
 
-          protected = set()
+          protected_projects = set()
 
           for entry in data.get('used_keys', []):
               ts = entry.get('timestamp', 0)
               if now_epoch - ts < cooldown_secs:
-                  key = entry.get('key', '')
-                  if key:
-                      protected.add(key)
+                  proj = entry.get('project', '')
+                  if proj:
+                      protected_projects.add(proj)
 
           for entry in data.get('expired_keys', []):
               ts = entry.get('timestamp', 0)
               if now_epoch - ts < cooldown_secs:
-                  key = entry.get('key', '')
-                  if key:
-                      protected.add(key)
+                  proj = entry.get('project', '')
+                  if proj:
+                      protected_projects.add(proj)
 
-          for k in protected:
-              print(k)
+          with open('/tmp/protected_projects.txt', 'w') as f:
+              for p in protected_projects:
+                  f.write(p + '\n')
+
+          print(f"🔒 {len(protected_projects)} projetos protegidos (cooldown 48h)")
+          for p in sorted(protected_projects):
+              print(f"   🛡️ {p}")
           PYPROT
-            )
 
-            PCOUNT=$(echo "$PROTECTED_PROJECTS" | grep -c . || echo "0")
-            echo "🔒 Keys protegidas (cooldown ativo): $PCOUNT"
-            echo "$PROTECTED_PROJECTS" > /tmp/protected_keys.txt
           else
             echo "ℹ️ Sem arquivo de uso - nenhuma proteção ativa"
-            touch /tmp/protected_keys.txt
+            touch /tmp/protected_projects.txt
           fi
 
       - name: "⚡ Reset Keys - 20 Workers"
@@ -103,6 +103,34 @@ jobs:
           set +e
           TOKEN="$1"; PROJECT="$2"; RESULT="$3"; KEYF="$4"; ACCOUNT="$5"; PROTECTED_FILE="$6"
 
+          # VERIFICAR SE PROJETO ESTÁ PROTEGIDO
+          if [ -f "$PROTECTED_FILE" ] && [ -s "$PROTECTED_FILE" ]; then
+            if grep -qxF "$PROJECT" "$PROTECTED_FILE" 2>/dev/null; then
+              # Projeto protegido - não mexer
+              # Pegar a key existente para manter no arquivo
+              curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                "https://serviceusage.googleapis.com/v1/projects/${PROJECT}/services/apikeys.googleapis.com:enable" -d'{}' &>/dev/null
+              sleep 2
+
+              EXISTING_KEY=""
+              KEYS_JSON=$(curl -sS -m15 -H "Authorization: Bearer $TOKEN" \
+                "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=1" 2>/dev/null)
+              FIRST_KEY=$(echo "$KEYS_JSON" | jq -r '.keys[0]?.name // empty')
+              if [ -n "$FIRST_KEY" ]; then
+                EXISTING_KEY=$(curl -sS -m10 -H "Authorization: Bearer $TOKEN" \
+                  "https://apikeys.googleapis.com/v2/${FIRST_KEY}/keyString" 2>/dev/null \
+                  | jq -r '.keyString // empty')
+              fi
+
+              echo "${ACCOUNT}|${PROJECT}|PROTECTED|0" > "$RESULT"
+              if [ -n "$EXISTING_KEY" ]; then
+                echo "$EXISTING_KEY" > "$KEYF"
+              fi
+              exit 0
+            fi
+          fi
+
+          # PROJETO NÃO PROTEGIDO - PROCESSAR NORMALMENTE
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://serviceusage.googleapis.com/v1/projects/${PROJECT}/services/apikeys.googleapis.com:enable" -d'{}' &>/dev/null &
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -111,40 +139,17 @@ jobs:
           sleep 3
 
           KEYS=$(curl -sS -m15 -H "Authorization: Bearer $TOKEN" \
-            "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=500" 2>/dev/null)
-
-          KEY_NAMES=$(echo "$KEYS" | jq -r '.keys[]?.name // empty')
-
-          PROJECT_PROTECTED=false
-          if [ -f "$PROTECTED_FILE" ] && [ -s "$PROTECTED_FILE" ]; then
-            while IFS= read -r K_NAME; do
-              [ -z "$K_NAME" ] && continue
-              K_STRING=$(curl -sS -m10 -H "Authorization: Bearer $TOKEN" \
-                "https://apikeys.googleapis.com/v2/${K_NAME}/keyString" 2>/dev/null \
-                | jq -r '.keyString // empty')
-              if [ -n "$K_STRING" ] && grep -qF "$K_STRING" "$PROTECTED_FILE" 2>/dev/null; then
-                PROJECT_PROTECTED=true
-                break
-              fi
-            done <<< "$KEY_NAMES"
-          fi
-
-          if [ "$PROJECT_PROTECTED" = "true" ]; then
-            echo "${ACCOUNT}|${PROJECT}|PROTECTED|0" > "$RESULT"
-            if [ -n "$K_STRING" ]; then
-              echo "$K_STRING" > "$KEYF"
-            fi
-            exit 0
-          fi
+            "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=500" 2>/dev/null \
+            | jq -r '.keys[]?.name // empty')
 
           DEL=0
-          if [ -n "$KEY_NAMES" ]; then
+          if [ -n "$KEYS" ]; then
             while IFS= read -r K; do
               [ -z "$K" ] && continue
               curl -sS -m10 -X DELETE -H "Authorization: Bearer $TOKEN" \
                 "https://apikeys.googleapis.com/v2/${K}" &>/dev/null &
               DEL=$((DEL+1))
-            done <<< "$KEY_NAMES"
+            done <<< "$KEYS"
             wait
             sleep 2
           fi
@@ -234,6 +239,8 @@ jobs:
 
           echo ""
           echo "📋 Total: $TASK projetos | $MAX_WORKERS workers"
+          PROT_COUNT=$(wc -l < /tmp/protected_projects.txt 2>/dev/null || echo "0")
+          echo "🔒 Projetos protegidos: $PROT_COUNT"
           echo ""
 
           [ "$TASK" -eq 0 ] && echo "Nenhum projeto" && echo "vazio" > gemini_keys.txt && > gemini_keys_only.txt && exit 0
@@ -261,7 +268,7 @@ jobs:
               [ $RUNNING -ge $MAX_WORKERS ] && sleep 0.5
             done
 
-            bash "$W/worker.sh" "$T" "$P" "$W/results/r_${N}" "$W/keys/k_${N}" "$A" "/tmp/protected_keys.txt" &
+            bash "$W/worker.sh" "$T" "$P" "$W/results/r_${N}" "$W/keys/k_${N}" "$A" "/tmp/protected_projects.txt" &
             PIDS[$!]=1
             RUNNING=$((RUNNING+1))
 
@@ -290,7 +297,12 @@ jobs:
 
           > gemini_keys_only.txt
 
+          # Gerar mapeamento key -> projeto
+          > key_project_map.json
+          echo '{' > key_project_map.json
+
           CUR=""
+          FIRST_MAP=true
           for R in $(find "$W/results" -name "r_*" | sort -V); do
             L=$(cat "$R")
             RA=$(echo "$L"|cut -d'|' -f1)
@@ -331,6 +343,33 @@ jobs:
             grep -qF "$KV" gemini_keys_only.txt 2>/dev/null || echo "$KV" >> gemini_keys_only.txt
           done
 
+          # Gerar key_project_map.json corretamente
+          python3 - "$W/results" <<'PYMAP'
+          import json, os, sys, glob
+
+          results_dir = sys.argv[1]
+          mapping = {}
+
+          for rf in sorted(glob.glob(os.path.join(results_dir, "r_*"))):
+              with open(rf, 'r') as f:
+                  line = f.read().strip()
+              parts = line.split('|')
+              if len(parts) >= 3:
+                  account = parts[0]
+                  project = parts[1]
+                  key = parts[2]
+                  if key not in ('ERRO', 'PROTECTED', ''):
+                      mapping[key] = {
+                          "project": project,
+                          "account": account
+                      }
+
+          with open('key_project_map.json', 'w') as f:
+              json.dump(mapping, f, indent=2)
+
+          print(f"📎 Mapeamento: {len(mapping)} keys -> projetos")
+          PYMAP
+
           TOTAL_KEYS=$(wc -l < gemini_keys_only.txt)
 
           {
@@ -356,7 +395,7 @@ jobs:
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add gemini_keys.txt gemini_keys_only.txt
+          git add gemini_keys.txt gemini_keys_only.txt key_project_map.json
           git diff --cached --quiet && echo "Sem mudanças" && exit 0
           K=$(wc -l < gemini_keys_only.txt)
           git commit -m "⚡ $K keys - $(date -u '+%H:%M UTC')"
