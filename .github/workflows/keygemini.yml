@@ -25,6 +25,61 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           ref: main
 
+      - name: "🔒 Carregar keys protegidas (cooldown 48h)"
+        id: protected
+        shell: bash
+        run: |
+          USAGE_FILE="key_usage.json"
+          PROTECTED_PROJECTS=""
+
+          if [ -f "$USAGE_FILE" ]; then
+            NOW_EPOCH=$(date -u +%s)
+            COOLDOWN_SECS=$((48 * 3600))
+
+            PROTECTED_PROJECTS=$(python3 - "$USAGE_FILE" "$NOW_EPOCH" "$COOLDOWN_SECS" <<'PYPROT'
+          import json, sys
+
+          usage_file = sys.argv[1]
+          now_epoch = int(sys.argv[2])
+          cooldown_secs = int(sys.argv[3])
+
+          try:
+              with open(usage_file, 'r') as f:
+                  data = json.load(f)
+          except:
+              sys.exit(0)
+
+          protected = set()
+
+          # Keys usadas recentemente - proteger seus projetos
+          for entry in data.get('used_keys', []):
+              ts = entry.get('timestamp', 0)
+              if now_epoch - ts < cooldown_secs:
+                  key = entry.get('key', '')
+                  if key:
+                      protected.add(key)
+
+          # Keys expiradas recentemente - também proteger
+          for entry in data.get('expired_keys', []):
+              ts = entry.get('timestamp', 0)
+              if now_epoch - ts < cooldown_secs:
+                  key = entry.get('key', '')
+                  if key:
+                      protected.add(key)
+
+          for k in protected:
+              print(k)
+          PYPROT
+            )
+
+            PCOUNT=$(echo "$PROTECTED_PROJECTS" | grep -c . || echo "0")
+            echo "🔒 Keys protegidas (cooldown ativo): $PCOUNT"
+            echo "$PROTECTED_PROJECTS" > /tmp/protected_keys.txt
+          else
+            echo "ℹ️ Sem arquivo de uso - nenhuma proteção ativa"
+            touch /tmp/protected_keys.txt
+          fi
+
       - name: "⚡ Reset Keys - 20 Workers"
         shell: bash
         run: |
@@ -34,11 +89,19 @@ jobs:
           W="$( mktemp -d )"
           mkdir -p "$W"/{results,keys,logs,queue}
 
+          # Carregar keys protegidas
+          PROTECTED_KEYS=""
+          if [ -f /tmp/protected_keys.txt ]; then
+            PROTECTED_KEYS=$(cat /tmp/protected_keys.txt)
+          fi
+
           cat > "$W/worker.sh" <<'WRK'
           #!/bin/bash
           set +e
-          TOKEN="$1"; PROJECT="$2"; RESULT="$3"; KEYF="$4"; ACCOUNT="$5"
+          TOKEN="$1"; PROJECT="$2"; RESULT="$3"; KEYF="$4"; ACCOUNT="$5"; PROTECTED_FILE="$6"
 
+          # Verificar se alguma key deste projeto está protegida
+          # Primeiro, listar as keys existentes
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://serviceusage.googleapis.com/v1/projects/${PROJECT}/services/apikeys.googleapis.com:enable" -d'{}' &>/dev/null &
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -47,17 +110,44 @@ jobs:
           sleep 3
 
           KEYS=$(curl -sS -m15 -H "Authorization: Bearer $TOKEN" \
-            "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=500" 2>/dev/null \
-            | jq -r '.keys[]?.name // empty')
+            "https://apikeys.googleapis.com/v2/projects/${PROJECT}/locations/global/keys?pageSize=500" 2>/dev/null)
 
+          KEY_NAMES=$(echo "$KEYS" | jq -r '.keys[]?.name // empty')
+
+          # Verificar se alguma key deste projeto está protegida
+          PROJECT_PROTECTED=false
+          if [ -f "$PROTECTED_FILE" ] && [ -s "$PROTECTED_FILE" ]; then
+            while IFS= read -r K_NAME; do
+              [ -z "$K_NAME" ] && continue
+              # Obter o keyString desta key
+              K_STRING=$(curl -sS -m10 -H "Authorization: Bearer $TOKEN" \
+                "https://apikeys.googleapis.com/v2/${K_NAME}/keyString" 2>/dev/null \
+                | jq -r '.keyString // empty')
+              if [ -n "$K_STRING" ] && grep -qF "$K_STRING" "$PROTECTED_FILE" 2>/dev/null; then
+                PROJECT_PROTECTED=true
+                break
+              fi
+            done <<< "$KEY_NAMES"
+          fi
+
+          if [ "$PROJECT_PROTECTED" = "true" ]; then
+            echo "${ACCOUNT}|${PROJECT}|PROTECTED|0" > "$RESULT"
+            # Manter a key existente
+            if [ -n "$K_STRING" ]; then
+              echo "$K_STRING" > "$KEYF"
+            fi
+            exit 0
+          fi
+
+          # Se não está protegido, proceder normalmente
           DEL=0
-          if [ -n "$KEYS" ]; then
+          if [ -n "$KEY_NAMES" ]; then
             while IFS= read -r K; do
               [ -z "$K" ] && continue
               curl -sS -m10 -X DELETE -H "Authorization: Bearer $TOKEN" \
                 "https://apikeys.googleapis.com/v2/${K}" &>/dev/null &
               DEL=$((DEL+1))
-            done <<< "$KEYS"
+            done <<< "$KEY_NAMES"
             wait
             sleep 2
           fi
@@ -174,7 +264,7 @@ jobs:
               [ $RUNNING -ge $MAX_WORKERS ] && sleep 0.5
             done
 
-            bash "$W/worker.sh" "$T" "$P" "$W/results/r_${N}" "$W/keys/k_${N}" "$A" &
+            bash "$W/worker.sh" "$T" "$P" "$W/results/r_${N}" "$W/keys/k_${N}" "$A" "/tmp/protected_keys.txt" &
             PIDS[$!]=1
             RUNNING=$((RUNNING+1))
 
@@ -191,7 +281,7 @@ jobs:
           echo "✅ $DONE_COUNT/$TASK processados!"
           echo ""
 
-          CREATED=0; DELETED=0; ERRORS=0
+          CREATED=0; DELETED=0; ERRORS=0; PROTECTED=0
 
           cat > gemini_keys.txt <<EOF
           ╔══════════════════════════════════════════════════╗
@@ -210,6 +300,16 @@ jobs:
             RP=$(echo "$L"|cut -d'|' -f2)
             RK=$(echo "$L"|cut -d'|' -f3)
             RD=$(echo "$L"|cut -d'|' -f4)
+
+            if [ "$RK" = "PROTECTED" ]; then
+              PROTECTED=$((PROTECTED+1))
+              if [ "$RA" != "$CUR" ]; then
+                CUR="$RA"
+                echo -e "\n📧 $RA\n────────────────────────────" >> gemini_keys.txt
+              fi
+              echo "  $RP = 🔒 PROTEGIDA (cooldown 48h)" >> gemini_keys.txt
+              continue
+            fi
 
             DELETED=$((DELETED + RD))
 
@@ -239,17 +339,19 @@ jobs:
           {
             echo ""
             echo "══════════════════════════════"
-            echo "  Contas:    $ACCT"
-            echo "  Projetos:  $TASK"
-            echo "  Deletadas: $DELETED"
-            echo "  Criadas:   $CREATED"
-            echo "  Erros:     $ERRORS"
-            echo "  Workers:   $MAX_WORKERS"
+            echo "  Contas:      $ACCT"
+            echo "  Projetos:    $TASK"
+            echo "  Deletadas:   $DELETED"
+            echo "  Criadas:     $CREATED"
+            echo "  Protegidas:  $PROTECTED"
+            echo "  Erros:       $ERRORS"
+            echo "  Workers:     $MAX_WORKERS"
             echo "══════════════════════════════"
           } | tee -a gemini_keys.txt
 
           echo ""
           echo "🔑 $TOTAL_KEYS keys geradas"
+          echo "🔒 $PROTECTED projetos protegidos (cooldown 48h)"
 
           rm -rf "$W"
 
