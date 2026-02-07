@@ -1,0 +1,751 @@
+name: "🔍 Analisar Live com Gemini"
+
+on:
+  workflow_dispatch:
+    inputs:
+      senha:
+        description: "🔒 Digite a senha para executar"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: ${{ github.event.inputs.senha == secrets.SENHA }}
+
+    steps:
+      - name: Checkout apiss repo
+        uses: actions/checkout@v4
+        with:
+          repository: Alisson990jd/apiss
+          token: ${{ secrets.GH_PAT }}
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "🔍 Analisar com Gemini"
+        shell: bash
+        run: |
+          set +e
+
+          ##############################################################
+          # CONFIGURAÇÕES
+          ##############################################################
+          ANALYSIS_FILE="analisar/analise_completa.txt"
+          KEYS_FILE="gemini_keys_only.txt"
+          USAGE_FILE="key_usage.json"
+          OUTPUT_DIR="analysis_output"
+          SEGMENTS_PER_CHUNK=60
+          COOLDOWN_HOURS=48
+          MODEL="gemini-2.5-flash"
+
+          mkdir -p "$OUTPUT_DIR" tmp_chunks tmp_venvs
+
+          ##############################################################
+          # VERIFICAR ARQUIVOS
+          ##############################################################
+          if [ ! -f "$ANALYSIS_FILE" ]; then
+            echo "❌ Arquivo de análise não encontrado: $ANALYSIS_FILE"
+            ls -la analisar/ 2>/dev/null || echo "Pasta analisar/ não existe"
+            exit 1
+          fi
+
+          if [ ! -f "$KEYS_FILE" ]; then
+            echo "❌ Arquivo de keys não encontrado: $KEYS_FILE"
+            exit 1
+          fi
+
+          if [ ! -f "$USAGE_FILE" ]; then
+            echo '{"used_keys":[],"expired_keys":[]}' > "$USAGE_FILE"
+          fi
+
+          echo "📄 Arquivo de análise: $(wc -l < "$ANALYSIS_FILE") linhas"
+          echo "🔑 Keys disponíveis: $(wc -l < "$KEYS_FILE")"
+
+          ##############################################################
+          # FUNÇÕES DE GERENCIAMENTO DE KEYS
+          ##############################################################
+          get_available_key() {
+            local NOW_EPOCH
+            NOW_EPOCH=$(date -u +%s)
+            local COOLDOWN_SECS=$((COOLDOWN_HOURS * 3600))
+
+            # Limpar keys que já passaram o cooldown
+            python3 - "$USAGE_FILE" "$NOW_EPOCH" "$COOLDOWN_SECS" <<'PYCLEAN'
+          import json, sys
+
+          usage_file = sys.argv[1]
+          now_epoch = int(sys.argv[2])
+          cooldown_secs = int(sys.argv[3])
+
+          with open(usage_file, 'r') as f:
+              data = json.load(f)
+
+          new_used = []
+          for entry in data.get('used_keys', []):
+              if now_epoch - entry.get('timestamp', 0) < cooldown_secs:
+                  new_used.append(entry)
+
+          new_expired = []
+          for entry in data.get('expired_keys', []):
+              if now_epoch - entry.get('timestamp', 0) < cooldown_secs:
+                  new_expired.append(entry)
+
+          data['used_keys'] = new_used
+          data['expired_keys'] = new_expired
+
+          with open(usage_file, 'w') as f:
+              json.dump(data, f, indent=2)
+          PYCLEAN
+
+            # Pegar keys em uso ou expiradas
+            local BLOCKED_KEYS
+            BLOCKED_KEYS=$(python3 - "$USAGE_FILE" <<'PYBLOCK'
+          import json, sys
+          with open(sys.argv[1], 'r') as f:
+              data = json.load(f)
+          keys = set()
+          for e in data.get('used_keys', []):
+              keys.add(e.get('key', ''))
+          for e in data.get('expired_keys', []):
+              keys.add(e.get('key', ''))
+          for k in keys:
+              if k:
+                  print(k)
+          PYBLOCK
+            )
+
+            # Encontrar uma key disponível
+            while IFS= read -r KEY; do
+              [ -z "$KEY" ] && continue
+              KEY=$(echo "$KEY" | tr -d '[:space:]')
+              if ! echo "$BLOCKED_KEYS" | grep -qF "$KEY"; then
+                echo "$KEY"
+                return 0
+              fi
+            done < "$KEYS_FILE"
+
+            echo ""
+            return 1
+          }
+
+          mark_key_used() {
+            local KEY="$1"
+            local CHUNK_ID="$2"
+            local NOW_EPOCH
+            NOW_EPOCH=$(date -u +%s)
+
+            python3 - "$USAGE_FILE" "$KEY" "$CHUNK_ID" "$NOW_EPOCH" <<'PYMARK'
+          import json, sys
+
+          usage_file = sys.argv[1]
+          key = sys.argv[2]
+          chunk_id = sys.argv[3]
+          timestamp = int(sys.argv[4])
+
+          with open(usage_file, 'r') as f:
+              data = json.load(f)
+
+          data['used_keys'].append({
+              "key": key,
+              "chunk_id": chunk_id,
+              "timestamp": timestamp,
+              "date": __import__('datetime').datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+          })
+
+          with open(usage_file, 'w') as f:
+              json.dump(data, f, indent=2)
+          PYMARK
+          }
+
+          mark_key_expired() {
+            local KEY="$1"
+            local REASON="$2"
+            local NOW_EPOCH
+            NOW_EPOCH=$(date -u +%s)
+
+            python3 - "$USAGE_FILE" "$KEY" "$REASON" "$NOW_EPOCH" <<'PYEXP'
+          import json, sys
+
+          usage_file = sys.argv[1]
+          key = sys.argv[2]
+          reason = sys.argv[3]
+          timestamp = int(sys.argv[4])
+
+          with open(usage_file, 'r') as f:
+              data = json.load(f)
+
+          # Remover de used_keys se estiver lá
+          data['used_keys'] = [e for e in data['used_keys'] if e.get('key') != key]
+
+          # Adicionar a expired_keys
+          data['expired_keys'].append({
+              "key": key,
+              "reason": reason,
+              "timestamp": timestamp,
+              "date": __import__('datetime').datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+          })
+
+          with open(usage_file, 'w') as f:
+              json.dump(data, f, indent=2)
+          PYEXP
+          }
+
+          ##############################################################
+          # DIVIDIR ARQUIVO EM CHUNKS DE 60 SEGMENTOS
+          ##############################################################
+          echo ""
+          echo "📦 Dividindo arquivo em chunks de $SEGMENTS_PER_CHUNK segmentos..."
+
+          python3 - "$ANALYSIS_FILE" "tmp_chunks" "$SEGMENTS_PER_CHUNK" <<'PYSPLIT'
+          import sys, re, os
+
+          analysis_file = sys.argv[1]
+          output_dir = sys.argv[2]
+          segments_per_chunk = int(sys.argv[3])
+
+          with open(analysis_file, 'r', encoding='utf-8', errors='replace') as f:
+              content = f.read()
+
+          # Extrair header (tudo antes do primeiro MINUTO)
+          header_match = re.search(r'^(.*?)(?=={10,}\nMINUTO\s+\d+)', content, re.DOTALL)
+          header = header_match.group(1).strip() if header_match else ""
+
+          # Encontrar todos os segmentos (MINUTO XXX)
+          # Pattern: bloco que começa com ===...MINUTO e vai até o próximo ===...MINUTO ou fim
+          segment_pattern = re.compile(
+              r'(={10,}\nMINUTO\s+(\d+)\s*\|[^\n]*\n={10,}\n.*?)(?=\n={10,}\nMINUTO\s+\d+|\n={10,}\nCONCLUIDO|\n={10,}\nANALISE|\Z)',
+              re.DOTALL
+          )
+
+          segments = []
+          seen_minutes = set()
+
+          for match in segment_pattern.finditer(content):
+              seg_text = match.group(1).strip()
+              minute_num = int(match.group(2))
+
+              # Evitar duplicatas (mesmo minuto pode aparecer em análises diferentes)
+              if minute_num not in seen_minutes:
+                  segments.append((minute_num, seg_text))
+                  seen_minutes.add(minute_num)
+
+          # Ordenar por número do minuto
+          segments.sort(key=lambda x: x[0])
+
+          print(f"Total de segmentos únicos encontrados: {len(segments)}")
+
+          # Dividir em chunks
+          os.makedirs(output_dir, exist_ok=True)
+          chunk_num = 0
+
+          for i in range(0, len(segments), segments_per_chunk):
+              chunk_segments = segments[i:i + segments_per_chunk]
+              chunk_num += 1
+
+              chunk_content = header + "\n\n" if header and chunk_num == 1 else ""
+              chunk_content += f"# CHUNK {chunk_num} - Segmentos {chunk_segments[0][0]} a {chunk_segments[-1][0]}\n\n"
+
+              for minute_num, seg_text in chunk_segments:
+                  chunk_content += seg_text + "\n\n"
+
+              chunk_file = os.path.join(output_dir, f"chunk_{chunk_num:04d}.txt")
+              with open(chunk_file, 'w', encoding='utf-8') as f:
+                  f.write(chunk_content)
+
+              seg_range = f"{chunk_segments[0][0]}-{chunk_segments[-1][0]}"
+              print(f"  Chunk {chunk_num}: {len(chunk_segments)} segmentos (min {seg_range}) -> {chunk_file}")
+
+          print(f"\nTotal de chunks: {chunk_num}")
+          PYSPLIT
+
+          TOTAL_CHUNKS=$(ls tmp_chunks/chunk_*.txt 2>/dev/null | wc -l)
+          echo ""
+          echo "📦 Total de chunks: $TOTAL_CHUNKS"
+
+          if [ "$TOTAL_CHUNKS" -eq 0 ]; then
+            echo "❌ Nenhum chunk gerado"
+            exit 1
+          fi
+
+          ##############################################################
+          # PROMPT TEMPLATE
+          ##############################################################
+          cat > tmp_prompt_template.txt <<'PROMPT_END'
+          (LEIA COM ATENÇÃO) Você receberá um arquivo TXT anexado que descreve o que aconteceu em cada segmento de uma live da plataforma Twitch. Cada segmento foi gerado pelo meu pipeline em blocos de 1 minuto consecutivo (ou seja, segmento 0 = 00:00:00–00:00:59, segmento 1 = 00:01:00–00:01:59, e assim por diante). O texto pode incluir tempos internos relativos (ex.: "00:45" dentro do segmento).
+
+          Esta análise é de uma live da Twitch. Considere elementos típicos como raids, subs, bits, emotes, interações com chat da Twitch e momentos de "hype".
+
+          Sua tarefa: analisar o conteúdo do arquivo e retornar APENAS um objeto JSON com uma lista de clipes recomendados para publicar em YouTube (monetizável) e TikTok (monetizável). Nada além do JSON – sem introdução, sem explicações, sem comentários.
+
+          Regras e requisitos obrigatórios:
+
+          Saída somente JSON (válido).
+
+          Cada item em clips deve seguir EXATAMENTE esta estrutura e nesta ordem de chaves:
+
+          clip_id (string): formato "clip_{start}_{end}" em segundos, ex: "clip_120_780".
+
+          platform (string): "youtube" ou "tiktok" ou "both".
+
+          title (string): título curto pronto para usar.
+
+          category (string): uma das ["gameplay","IRL","just_chatting","react"].
+
+          start_time (string, hh:mm:ss) – instante inicial absoluto desde o início da live.
+
+          end_time (string, hh:mm:ss) – instante final absoluto.
+
+          duration_seconds (integer).
+
+          segments_combined (array of integers): índices dos segmentos originais combinados (p.ex. [2,3,4,5]).
+
+          reason (string): 1-2 frases curtas (máx 30 palavras) dizendo por que clipar.
+
+          tags (array of strings): até 8 tags relevantes.
+
+          monetizable (boolean): true ou false.
+
+          safety_flags (array of strings): vazio [] se nenhum problema; caso contrário inclua flags como "copyright_music", "explicit_sex", "hate_speech", "privacy_issue", "medical_misinformation", etc.
+
+          recommended_description (string): 1-3 frases curtas para usar na descrição (máx 40 palavras).
+
+          thumbnail_text (string): texto curto (3–6 palavras) chamativo para thumbnail.
+
+          thumbnail_timestamp (string, hh:mm:ss): momento exato dentro do clipe para tirar a screenshot da thumbnail.
+
+          Regras de duração e combinação (CRÍTICO: Segmentos são curtos de 1 min):
+
+          Para YouTube monetizável: cada clip deve ter ≥ 600 segundos (10 minutos).
+
+          Como cada segmento tem apenas 1 minuto, você OBRIGATORIAMENTE deve combinar pelo menos 10 segmentos contíguos.
+
+          Prefira gerar clipes com 900–1800 segundos (15 a 30 minutos), combinando de 15 a 30 segmentos adjacentes.
+
+          Não junte partes não-contíguas (os clipes precisam ser contínuos na linha do tempo).
+
+          Para TikTok monetizável: cada clip deve ter ≥ 60 segundos.
+
+          Como cada segmento já tem ~60s, verifique se o evento começa e termina no mesmo segmento. Se o evento interessante cortar a virada do minuto, combine 2 ou mais segmentos para não cortar o contexto.
+
+          Se o mesmo trecho serve para ambas as plataformas sem violar os mínimos, use "both" e mantenha start_time/end_time do trecho combinado.
+
+          Detecção de gameplay completa:
+
+          Além dos clipes normais, se o arquivo mostrar que o streamer jogou um jogo específico de forma contínua por longos períodos, gere também clipes inteiros cobrindo toda a gameplay.
+
+          Esses clipes de gameplay completa devem ser marcados com category:"gameplay" e podem ter várias horas (centenas de segmentos combinados).
+
+          O título e o thumbnail_text devem ser genéricos mas chamativos.
+
+          Geração de timestamps:
+
+          Use horas absolutas desde o início da live em formato hh:mm:ss.
+
+          Calcule duration_seconds exatamente (end - start).
+
+          Se o texto trouxer tempos relativos internos (ex.: "aos 00:30 do segmento"), converta corretamente para o tempo absoluto usando o índice do segmento: (segment_index * 60s) + offset_segundos.
+
+          Formato JSON e validação:
+
+          Retorne apenas o JSON bem formado. Ex.: {"clips":[{...},{...}]}.
+
+          Ordem das chaves em cada clip deve seguir exatamente a lista do item (2).
+
+          EXEMPLO DE SAÍDA:
+          {
+          "clips":[
+          {
+          "clip_id":"clip_120_1680",
+          "platform":"youtube",
+          "title":"Melhores momentos da partida",
+          "category":"gameplay",
+          "start_time":"00:02:00",
+          "end_time":"00:28:00",
+          "duration_seconds":1560,
+          "segments_combined":[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+          "reason":"sequência de jogadas com muita reação do público",
+          "tags":["gameplay","highlights","reaction"],
+          "monetizable":true,
+          "safety_flags":[],
+          "recommended_description":"Melhores momentos da partida em uma sequência épica com muita emoção!",
+          "thumbnail_text":"Jogada insana!",
+          "thumbnail_timestamp":"00:15:00"
+          }
+          ]
+          }
+
+          Agora analise o conteúdo abaixo e gere somente o JSON seguindo todas as regras acima.
+
+          PROMPT_END
+
+          ##############################################################
+          # PROCESSAR CADA CHUNK
+          ##############################################################
+          echo ""
+          echo "🚀 Iniciando análise de $TOTAL_CHUNKS chunks..."
+          echo ""
+
+          CHUNK_NUM=0
+          SUCCESS_COUNT=0
+          TOTAL_CLIPS=0
+
+          for CHUNK_FILE in $(ls tmp_chunks/chunk_*.txt | sort -V); do
+            CHUNK_NUM=$((CHUNK_NUM + 1))
+            CHUNK_NAME=$(basename "$CHUNK_FILE" .txt)
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📦 Chunk $CHUNK_NUM/$TOTAL_CHUNKS: $CHUNK_NAME"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            CHUNK_CONTENT=$(cat "$CHUNK_FILE")
+            CHUNK_LINES=$(wc -l < "$CHUNK_FILE")
+            echo "   📄 $CHUNK_LINES linhas"
+
+            # Loop infinito até conseguir
+            ATTEMPT=0
+            CHUNK_SUCCESS=false
+
+            while [ "$CHUNK_SUCCESS" = "false" ]; do
+              ATTEMPT=$((ATTEMPT + 1))
+
+              echo "   🔄 Tentativa #$ATTEMPT"
+
+              # Obter key disponível
+              API_KEY=$(get_available_key)
+
+              if [ -z "$API_KEY" ]; then
+                echo "   ⚠️ Sem keys disponíveis! Aguardando 5 minutos..."
+                sleep 300
+                continue
+              fi
+
+              KEY_SHORT="${API_KEY:0:8}...${API_KEY: -4}"
+              echo "   🔑 Key: $KEY_SHORT"
+
+              # Marcar key como usada
+              mark_key_used "$API_KEY" "$CHUNK_NAME"
+
+              # Commit do usage file para persistir
+              git add "$USAGE_FILE" 2>/dev/null
+              git diff --cached --quiet 2>/dev/null || {
+                git commit -m "🔄 Key em uso: $CHUNK_NAME" --quiet 2>/dev/null
+                git push --quiet 2>/dev/null
+              }
+
+              # Criar venv isolada
+              VENV_DIR="tmp_venvs/venv_${CHUNK_NAME}_${ATTEMPT}"
+              echo "   📦 Criando venv: $VENV_DIR"
+
+              python3 -m venv "$VENV_DIR" 2>/dev/null
+              source "$VENV_DIR/bin/activate"
+              pip install -q google-genai 2>/dev/null
+
+              # Criar script de análise
+              SCRIPT_FILE="tmp_venvs/analyze_${CHUNK_NAME}_${ATTEMPT}.py"
+
+              cat > "$SCRIPT_FILE" <<PYSCRIPT
+          import sys
+          import json
+          import re
+          import os
+
+          def main():
+              api_key = sys.argv[1]
+              chunk_file = sys.argv[2]
+              output_file = sys.argv[3]
+              prompt_file = sys.argv[4]
+
+              # Ler prompt template
+              with open(prompt_file, 'r', encoding='utf-8') as f:
+                  prompt_template = f.read()
+
+              # Ler chunk
+              with open(chunk_file, 'r', encoding='utf-8') as f:
+                  chunk_content = f.read()
+
+              # Montar prompt completo
+              full_prompt = prompt_template + "\n\n" + chunk_content
+
+              try:
+                  from google import genai
+
+                  client = genai.Client(api_key=api_key)
+
+                  response = client.models.generate_content(
+                      model="$MODEL",
+                      contents=full_prompt,
+                      config={
+                          "temperature": 0.3,
+                          "max_output_tokens": 65536,
+                      }
+                  )
+
+                  raw_text = response.text.strip()
+
+                  # Limpar markdown code blocks se houver
+                  if raw_text.startswith("\`\`\`"):
+                      lines = raw_text.split("\n")
+                      # Remover primeira e última linha de code block
+                      if lines[0].startswith("\`\`\`"):
+                          lines = lines[1:]
+                      if lines and lines[-1].strip() == "\`\`\`":
+                          lines = lines[:-1]
+                      raw_text = "\n".join(lines).strip()
+
+                  # Tentar parsear JSON
+                  parsed = json.loads(raw_text)
+
+                  # Validar estrutura
+                  if "clips" not in parsed:
+                      print("ERROR: JSON não contém 'clips'", file=sys.stderr)
+                      sys.exit(1)
+
+                  if not isinstance(parsed["clips"], list):
+                      print("ERROR: 'clips' não é uma lista", file=sys.stderr)
+                      sys.exit(1)
+
+                  # Salvar resultado
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      json.dump(parsed, f, indent=2, ensure_ascii=False)
+
+                  clip_count = len(parsed["clips"])
+                  print(f"OK:{clip_count}")
+
+              except json.JSONDecodeError as e:
+                  print(f"ERROR_JSON: {e}", file=sys.stderr)
+                  # Salvar raw para debug
+                  debug_file = output_file + ".raw.txt"
+                  with open(debug_file, 'w', encoding='utf-8') as f:
+                      f.write(raw_text if 'raw_text' in dir() else "NO_RESPONSE")
+                  sys.exit(2)
+
+              except Exception as e:
+                  error_msg = str(e)
+                  print(f"ERROR_API: {error_msg}", file=sys.stderr)
+                  sys.exit(3)
+
+          if __name__ == "__main__":
+              main()
+          PYSCRIPT
+
+              # Executar análise
+              OUTPUT_JSON="$OUTPUT_DIR/${CHUNK_NAME}.json"
+
+              RESULT=$(python3 "$SCRIPT_FILE" \
+                "$API_KEY" \
+                "$CHUNK_FILE" \
+                "$OUTPUT_JSON" \
+                "tmp_prompt_template.txt" \
+                2>&1)
+
+              EXIT_CODE=$?
+
+              # Desativar venv
+              deactivate 2>/dev/null
+
+              if [ $EXIT_CODE -eq 0 ]; then
+                CLIPS_IN_CHUNK=$(echo "$RESULT" | grep -oP 'OK:\K\d+' || echo "0")
+                echo "   ✅ Sucesso! $CLIPS_IN_CHUNK clips gerados"
+                TOTAL_CLIPS=$((TOTAL_CLIPS + CLIPS_IN_CHUNK))
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                CHUNK_SUCCESS=true
+
+                # Limpar venv
+                rm -rf "$VENV_DIR" "$SCRIPT_FILE"
+              else
+                echo "   ❌ Erro (code=$EXIT_CODE): $(echo "$RESULT" | tail -1)"
+                echo "   🔄 Marcando key como expirada e tentando outra..."
+
+                # Marcar key como expirada
+                mark_key_expired "$API_KEY" "error_code_${EXIT_CODE}_chunk_${CHUNK_NAME}"
+
+                # Commit do usage file
+                git add "$USAGE_FILE" 2>/dev/null
+                git diff --cached --quiet 2>/dev/null || {
+                  git commit -m "❌ Key expirada: $CHUNK_NAME tentativa $ATTEMPT" --quiet 2>/dev/null
+                  git push --quiet 2>/dev/null
+                }
+
+                # Limpar venv com erro
+                rm -rf "$VENV_DIR" "$SCRIPT_FILE"
+
+                # Pequeno delay antes de tentar de novo
+                sleep 5
+              fi
+            done
+
+            echo ""
+          done
+
+          ##############################################################
+          # JUNTAR TODOS OS JSON EM UM SÓ
+          ##############################################################
+          echo ""
+          echo "🔗 Juntando todos os resultados..."
+
+          python3 - "$OUTPUT_DIR" <<'PYMERGE'
+          import json, os, sys, glob
+
+          output_dir = sys.argv[1]
+          all_clips = []
+
+          json_files = sorted(glob.glob(os.path.join(output_dir, "chunk_*.json")))
+
+          for jf in json_files:
+              try:
+                  with open(jf, 'r', encoding='utf-8') as f:
+                      data = json.load(f)
+                  clips = data.get('clips', [])
+                  all_clips.extend(clips)
+                  print(f"  ✅ {os.path.basename(jf)}: {len(clips)} clips")
+              except Exception as e:
+                  print(f"  ❌ {os.path.basename(jf)}: {e}")
+
+          # Deduplicar por clip_id
+          seen_ids = set()
+          unique_clips = []
+          for clip in all_clips:
+              cid = clip.get('clip_id', '')
+              if cid not in seen_ids:
+                  seen_ids.add(cid)
+                  unique_clips.append(clip)
+
+          # Ordenar por start_time
+          def time_to_secs(t):
+              try:
+                  parts = t.split(':')
+                  return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+              except:
+                  return 0
+
+          unique_clips.sort(key=lambda c: time_to_secs(c.get('start_time', '00:00:00')))
+
+          final = {"clips": unique_clips}
+
+          # Salvar JSON final
+          with open("analise_resultado.json", 'w', encoding='utf-8') as f:
+              json.dump(final, f, indent=2, ensure_ascii=False)
+
+          # Estatísticas
+          yt = sum(1 for c in unique_clips if c.get('platform') in ('youtube', 'both'))
+          tt = sum(1 for c in unique_clips if c.get('platform') in ('tiktok', 'both'))
+          total_dur = sum(c.get('duration_seconds', 0) for c in unique_clips)
+
+          print(f"\n{'='*50}")
+          print(f"  Total de clips únicos: {len(unique_clips)}")
+          print(f"  YouTube/Both: {yt}")
+          print(f"  TikTok/Both: {tt}")
+          print(f"  Duração total: {total_dur//3600}h{(total_dur%3600)//60}m")
+          print(f"{'='*50}")
+          PYMERGE
+
+          ##############################################################
+          # GERAR RELATÓRIO TXT LEGÍVEL
+          ##############################################################
+          python3 - <<'PYREPORT'
+          import json
+
+          with open("analise_resultado.json", 'r', encoding='utf-8') as f:
+              data = json.load(f)
+
+          clips = data.get('clips', [])
+
+          with open("analise_resultado.txt", 'w', encoding='utf-8') as f:
+              f.write("╔══════════════════════════════════════════════════╗\n")
+              f.write("║     🎬 RESULTADO DA ANÁLISE - CLIPES GERADOS    ║\n")
+              f.write("╚══════════════════════════════════════════════════╝\n\n")
+
+              yt_clips = [c for c in clips if c.get('platform') in ('youtube', 'both')]
+              tt_clips = [c for c in clips if c.get('platform') in ('tiktok', 'both')]
+
+              f.write(f"Total: {len(clips)} clipes\n")
+              f.write(f"YouTube: {len(yt_clips)} | TikTok: {len(tt_clips)}\n")
+              f.write("=" * 60 + "\n\n")
+
+              if yt_clips:
+                  f.write("🎥 CLIPES PARA YOUTUBE\n")
+                  f.write("-" * 60 + "\n\n")
+                  for i, c in enumerate(yt_clips, 1):
+                      f.write(f"  [{i}] {c.get('title', 'Sem título')}\n")
+                      f.write(f"      ⏱️  {c.get('start_time')} → {c.get('end_time')} ({c.get('duration_seconds', 0)}s)\n")
+                      f.write(f"      📂 {c.get('category', '?')}\n")
+                      f.write(f"      💡 {c.get('reason', '')}\n")
+                      f.write(f"      🏷️  {', '.join(c.get('tags', []))}\n")
+                      f.write(f"      💰 Monetizável: {'✅' if c.get('monetizable') else '❌'}\n")
+                      flags = c.get('safety_flags', [])
+                      if flags:
+                          f.write(f"      ⚠️  Flags: {', '.join(flags)}\n")
+                      f.write(f"      📝 {c.get('recommended_description', '')}\n")
+                      f.write(f"      🖼️  Thumbnail: \"{c.get('thumbnail_text', '')}\" @ {c.get('thumbnail_timestamp', '')}\n")
+                      f.write(f"      📎 Segmentos: {c.get('segments_combined', [])}\n")
+                      f.write("\n")
+
+              if tt_clips:
+                  f.write("\n📱 CLIPES PARA TIKTOK\n")
+                  f.write("-" * 60 + "\n\n")
+                  for i, c in enumerate(tt_clips, 1):
+                      f.write(f"  [{i}] {c.get('title', 'Sem título')}\n")
+                      f.write(f"      ⏱️  {c.get('start_time')} → {c.get('end_time')} ({c.get('duration_seconds', 0)}s)\n")
+                      f.write(f"      📂 {c.get('category', '?')}\n")
+                      f.write(f"      💡 {c.get('reason', '')}\n")
+                      f.write(f"      🏷️  {', '.join(c.get('tags', []))}\n")
+                      f.write(f"      💰 Monetizável: {'✅' if c.get('monetizable') else '❌'}\n")
+                      f.write(f"      📝 {c.get('recommended_description', '')}\n")
+                      f.write(f"      🖼️  Thumbnail: \"{c.get('thumbnail_text', '')}\" @ {c.get('thumbnail_timestamp', '')}\n")
+                      f.write("\n")
+
+          print("📄 Relatório TXT gerado: analise_resultado.txt")
+          PYREPORT
+
+          ##############################################################
+          # RESUMO FINAL
+          ##############################################################
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║          ✅ ANÁLISE CONCLUÍDA                    ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  Chunks processados: $SUCCESS_COUNT/$TOTAL_CHUNKS"
+          echo "║  Total de clips:     $TOTAL_CLIPS"
+          echo "╚══════════════════════════════════════════════════╝"
+
+          # Limpar temporários
+          rm -rf tmp_chunks tmp_venvs tmp_prompt_template.txt
+
+      - name: Commit resultados
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add analise_resultado.json analise_resultado.txt key_usage.json
+          git diff --cached --quiet && echo "Sem mudanças" && exit 0
+          CLIPS=$(python3 -c "import json; print(len(json.load(open('analise_resultado.json'))['clips']))" 2>/dev/null || echo "0")
+          git commit -m "🎬 Análise: $CLIPS clips - $(date -u '+%H:%M UTC')"
+          git push
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: analise-resultado
+          path: |
+            analise_resultado.json
+            analise_resultado.txt
+          retention-days: 30
+
+  senha-errada:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.senha != secrets.SENHA }}
+    steps:
+      - name: "🚫 Acesso negado"
+        run: |
+          echo "╔═══════════════════════════════════╗"
+          echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
+          echo "╚═══════════════════════════════════╝"
+          exit 1
