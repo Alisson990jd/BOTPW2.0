@@ -15,9 +15,21 @@ jobs:
   reset-keys:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ github.event.inputs.senha == secrets.SENHA }}
 
     steps:
+      - name: "🔒 Verificar senha"
+        env:
+          SENHA_CORRETA: ${{ secrets.SENHA }}
+          SENHA_INPUT: ${{ github.event.inputs.senha }}
+        run: |
+          if [ "$SENHA_INPUT" != "$SENHA_CORRETA" ]; then
+            echo "╔═══════════════════════════════════╗"
+            echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
+            echo "╚═══════════════════════════════════╝"
+            exit 1
+          fi
+          echo "✅ Senha correta"
+
       - name: Checkout apiss repo
         uses: actions/checkout@v4
         with:
@@ -30,7 +42,6 @@ jobs:
         shell: bash
         run: |
           USAGE_FILE="key_usage.json"
-          PROTECTED_PROJECTS=""
 
           if [ -f "$USAGE_FILE" ]; then
             NOW_EPOCH=$(date -u +%s)
@@ -51,7 +62,6 @@ jobs:
 
           protected = set()
 
-          # Keys usadas recentemente - proteger seus projetos
           for entry in data.get('used_keys', []):
               ts = entry.get('timestamp', 0)
               if now_epoch - ts < cooldown_secs:
@@ -59,7 +69,6 @@ jobs:
                   if key:
                       protected.add(key)
 
-          # Keys expiradas recentemente - também proteger
           for entry in data.get('expired_keys', []):
               ts = entry.get('timestamp', 0)
               if now_epoch - ts < cooldown_secs:
@@ -89,19 +98,11 @@ jobs:
           W="$( mktemp -d )"
           mkdir -p "$W"/{results,keys,logs,queue}
 
-          # Carregar keys protegidas
-          PROTECTED_KEYS=""
-          if [ -f /tmp/protected_keys.txt ]; then
-            PROTECTED_KEYS=$(cat /tmp/protected_keys.txt)
-          fi
-
           cat > "$W/worker.sh" <<'WRK'
           #!/bin/bash
           set +e
           TOKEN="$1"; PROJECT="$2"; RESULT="$3"; KEYF="$4"; ACCOUNT="$5"; PROTECTED_FILE="$6"
 
-          # Verificar se alguma key deste projeto está protegida
-          # Primeiro, listar as keys existentes
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://serviceusage.googleapis.com/v1/projects/${PROJECT}/services/apikeys.googleapis.com:enable" -d'{}' &>/dev/null &
           curl -sS -m10 -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -114,12 +115,10 @@ jobs:
 
           KEY_NAMES=$(echo "$KEYS" | jq -r '.keys[]?.name // empty')
 
-          # Verificar se alguma key deste projeto está protegida
           PROJECT_PROTECTED=false
           if [ -f "$PROTECTED_FILE" ] && [ -s "$PROTECTED_FILE" ]; then
             while IFS= read -r K_NAME; do
               [ -z "$K_NAME" ] && continue
-              # Obter o keyString desta key
               K_STRING=$(curl -sS -m10 -H "Authorization: Bearer $TOKEN" \
                 "https://apikeys.googleapis.com/v2/${K_NAME}/keyString" 2>/dev/null \
                 | jq -r '.keyString // empty')
@@ -132,14 +131,12 @@ jobs:
 
           if [ "$PROJECT_PROTECTED" = "true" ]; then
             echo "${ACCOUNT}|${PROJECT}|PROTECTED|0" > "$RESULT"
-            # Manter a key existente
             if [ -n "$K_STRING" ]; then
               echo "$K_STRING" > "$KEYF"
             fi
             exit 0
           fi
 
-          # Se não está protegido, proceder normalmente
           DEL=0
           if [ -n "$KEY_NAMES" ]; then
             while IFS= read -r K; do
@@ -364,14 +361,3 @@ jobs:
           K=$(wc -l < gemini_keys_only.txt)
           git commit -m "⚡ $K keys - $(date -u '+%H:%M UTC')"
           git push
-
-  senha-errada:
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.senha != secrets.SENHA }}
-    steps:
-      - name: "🚫 Acesso negado"
-        run: |
-          echo "╔═══════════════════════════════════╗"
-          echo "║   🚫 SENHA INCORRETA - NEGADO    ║"
-          echo "╚═══════════════════════════════════╝"
-          exit 1
