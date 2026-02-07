@@ -3,7 +3,7 @@ name: "🔑 Reset Gemini API Keys"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # a cada 6 horas
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -15,20 +15,36 @@ jobs:
 
     steps:
       # ─────────────────────────────────────────────
-      # 1. Checkout do repositório
+      # 1. Checkout do repositório APISS
       # ─────────────────────────────────────────────
-      - name: Checkout
+      - name: Checkout apiss repo
         uses: actions/checkout@v4
         with:
+          repository: Alisson990jd/apiss
           token: ${{ secrets.GH_PAT }}
+          ref: main
 
       # ─────────────────────────────────────────────
-      # 2. Script principal
+      # 2. Verificar estrutura
+      # ─────────────────────────────────────────────
+      - name: Debug - listar arquivos
+        run: |
+          echo "📂 Raiz do repositório:"
+          ls -la
+          echo ""
+          echo "📂 Conteúdo de tokens/ (se existir):"
+          ls -la tokens/ 2>/dev/null || echo "Pasta tokens/ NÃO encontrada"
+          echo ""
+          echo "📂 Busca recursiva por .json:"
+          find . -name "*.json" -type f | head -20
+
+      # ─────────────────────────────────────────────
+      # 3. Script principal
       # ─────────────────────────────────────────────
       - name: Reset all Gemini API Keys
         shell: bash
         run: |
-          set +e  # não abortar em erros individuais
+          set +e
 
           # ── Constantes ──
           RATE_LIMIT_SLEEP=4
@@ -44,7 +60,6 @@ jobs:
           TOTAL_PROJECTS=0
           TOTAL_ACCOUNTS=0
 
-          # ── Arquivo de saída ──
           cat > "$OUTPUT" <<EOF
           ╔══════════════════════════════════════════════════╗
           ║         GEMINI API KEYS - AUTO GENERATED        ║
@@ -130,7 +145,6 @@ jobs:
               done_status=$(echo "$result" | jq -r '.done // false')
 
               if [ "$done_status" = "true" ]; then
-                # Checar se houve erro
                 local error
                 error=$(echo "$result" | jq -r '.error // empty')
                 if [ -n "$error" ] && [ "$error" != "null" ] && [ "$error" != "" ]; then
@@ -161,7 +175,6 @@ jobs:
             op_name=$(echo "$resp" | jq -r '.name // empty')
 
             if [ -n "$op_name" ]; then
-              # Esperar operação de delete concluir
               sleep 2
               return 0
             fi
@@ -206,7 +219,6 @@ jobs:
               return 1
             fi
 
-            # Esperar operação
             local op_result
             op_result=$(wait_for_operation "$token" "$op_name")
 
@@ -215,7 +227,6 @@ jobs:
               return 1
             fi
 
-            # Extrair resource name da key criada
             local key_resource
             key_resource=$(echo "$op_result" | jq -r '.response.name // empty')
 
@@ -225,7 +236,6 @@ jobs:
               return 1
             fi
 
-            # Obter a key string
             sleep 2
             local key_string_resp
             key_string_resp=$(curl -sS --max-time 30 \
@@ -250,6 +260,8 @@ jobs:
 
           if [ ! -d "tokens" ]; then
             echo "❌ Pasta 'tokens/' não encontrada!"
+            echo "📂 Listando raiz:"
+            ls -la
             exit 1
           fi
 
@@ -273,7 +285,6 @@ jobs:
             echo "║ 📧 Conta #${TOTAL_ACCOUNTS}: $ACCOUNT"
             echo "╚══════════════════════════════════════════"
 
-            # ── Obter access token ──
             echo "  🔄 Refreshing access token..."
             ACCESS_TOKEN=$(refresh_access_token "$TOKEN_FILE")
 
@@ -285,7 +296,6 @@ jobs:
             fi
             echo "  ✅ Autenticado com sucesso"
 
-            # ── Info do usuário ──
             USER_EMAIL=$(curl -sS --max-time 15 \
               -H "Authorization: Bearer $ACCESS_TOKEN" \
               "https://www.googleapis.com/oauth2/v2/userinfo" 2>/dev/null \
@@ -300,10 +310,8 @@ jobs:
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             } >> "$OUTPUT"
 
-            # ── Listar projetos ──
             echo "  📁 Listando projetos..."
 
-            # Paginação básica
             ALL_PROJECTS=""
             PAGE_TOKEN=""
 
@@ -344,7 +352,6 @@ jobs:
             PROJ_COUNT=$(echo "$ALL_PROJECTS" | wc -l)
             echo "  📊 $PROJ_COUNT projetos encontrados"
 
-            # ── Processar cada projeto ──
             while IFS= read -r PROJECT_ID; do
               [ -z "$PROJECT_ID" ] && continue
 
@@ -352,14 +359,12 @@ jobs:
               echo ""
               echo "  ┌─ 📁 Projeto: $PROJECT_ID"
 
-              # Habilitar APIs necessárias
               echo "  │  🔧 Habilitando APIs..."
               enable_api "$ACCESS_TOKEN" "$PROJECT_ID" "apikeys.googleapis.com"
               enable_api "$ACCESS_TOKEN" "$PROJECT_ID" "generativelanguage.googleapis.com"
               echo "  │  ⏳ Aguardando propagação..."
               sleep $ENABLE_API_WAIT
 
-              # Listar API keys existentes
               echo "  │  📋 Listando keys existentes..."
               KEYS_RESP=$(curl -sS --max-time 30 \
                 -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -371,19 +376,15 @@ jobs:
                 KEY_COUNT=$(echo "$KEY_NAMES" | wc -l)
                 echo "  │  🔍 $KEY_COUNT keys encontradas"
 
-                # Deletar cada key
                 while IFS= read -r KEY_NAME; do
                   [ -z "$KEY_NAME" ] && continue
 
-                  # Obter detalhes da key para log
                   KEY_DETAIL=$(curl -sS --max-time 15 \
                     -H "Authorization: Bearer $ACCESS_TOKEN" \
                     "https://apikeys.googleapis.com/v2/${KEY_NAME}" 2>/dev/null)
 
                   KEY_DISPLAY=$(echo "$KEY_DETAIL" | jq -r '.displayName // "sem-nome"')
-                  KEY_UID=$(echo "$KEY_DETAIL" | jq -r '.uid // "?"')
 
-                  # Verificar se é Gemini (ou sem restrição)
                   HAS_GEMINI_TARGET=$(echo "$KEY_DETAIL" | jq -r '
                     if (.restrictions.apiTargets // []) | length > 0 then
                       if [.restrictions.apiTargets[].service] | any(. == "generativelanguage.googleapis.com") then
@@ -410,7 +411,6 @@ jobs:
                 echo "  │  📭 Nenhuma key existente"
               fi
 
-              # Criar nova key Gemini
               echo "  │  🔑 Criando nova Gemini API key..."
               NEW_KEY=$(create_gemini_key "$ACCESS_TOKEN" "$PROJECT_ID")
 
@@ -434,7 +434,6 @@ jobs:
 
           done <<< "$TOKEN_FILES"
 
-          # ── Resumo final ──
           {
             echo ""
             echo "╔══════════════════════════════════════════════════╗"
@@ -453,19 +452,17 @@ jobs:
           echo "══════════════════════════════════════════"
           echo "📊 RESUMO FINAL"
           echo "══════════════════════════════════════════"
-          echo "  Contas:   $TOTAL_ACCOUNTS"
-          echo "  Projetos: $TOTAL_PROJECTS"
+          echo "  Contas:    $TOTAL_ACCOUNTS"
+          echo "  Projetos:  $TOTAL_PROJECTS"
           echo "  Deletadas: $TOTAL_DELETED"
           echo "  Criadas:   $TOTAL_CREATED"
           echo "  Erros:     $TOTAL_ERRORS"
           echo "══════════════════════════════════════════"
-          echo ""
 
-          echo "📄 Conteúdo do arquivo de keys:"
           cat "$OUTPUT"
 
       # ─────────────────────────────────────────────
-      # 3. Commit e push dos resultados
+      # 4. Commit e push
       # ─────────────────────────────────────────────
       - name: Commit and push keys
         run: |
@@ -477,7 +474,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nenhuma alteração para commitar"
           else
-            git commit -m "🔑 Gemini keys resetadas - $(date -u '+%Y-%m-%d %H:%M UTC') | Keys: $(wc -l < gemini_keys_only.txt)"
+            git commit -m "🔑 Keys resetadas - $(date -u '+%Y-%m-%d %H:%M UTC') | $(wc -l < gemini_keys_only.txt) keys"
             git push
-            echo "✅ Push realizado com sucesso!"
+            echo "✅ Push realizado!"
           fi
