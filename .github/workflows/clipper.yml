@@ -175,6 +175,7 @@ jobs:
                   '--no-playlist',
                   '--retries', '10',
                   '--fragment-retries', '10',
+                  '-N', '20',
                   vod_url
               ]
               
