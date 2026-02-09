@@ -1,0 +1,755 @@
+# .github/workflows/youtube-clipper.yml
+name: YouTube Clipper - VOD to Clips
+
+on:
+  workflow_dispatch:
+    inputs:
+      vod_link:
+        description: 'Link do VOD da Twitch'
+        required: true
+        type: string
+      senha:
+        description: 'Senha para executar'
+        required: true
+        type: string
+
+jobs:
+  validate-and-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: 🔐 Validar Senha
+        run: |
+          if [ "${{ github.event.inputs.senha }}" != "${{ secrets.SENHA }}" ]; then
+            echo "❌ Senha incorreta!"
+            exit 1
+          fi
+          echo "✅ Senha validada com sucesso!"
+
+      - name: 📥 Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependências do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          
+      - name: 🎭 Instalar Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 📦 Instalar dependências Python
+        run: |
+          pip install --upgrade pip
+          pip install requests google-auth google-auth-oauthlib google-api-python-client
+          pip install yt-dlp httpx aiohttp pillow
+          pip install playwright
+
+      - name: 📥 Baixar arquivos do repositório externo
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "📥 Baixando analise_resultado.json..."
+          curl -H "Authorization: token $GH_PAT" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o analise_resultado.json \
+               "https://api.github.com/repos/Alisson990jd/apiss/contents/analise_resultado.json"
+          
+          echo "📥 Baixando gmail_token.pkl..."
+          curl -H "Authorization: token $GH_PAT" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o gmail_token.pkl \
+               "https://api.github.com/repos/Alisson990jd/apiss/contents/gmail_token.pkl"
+          
+          echo "📥 Baixando arquivos da pasta analisar..."
+          mkdir -p analisar
+          
+          # Listar arquivos na pasta analisar
+          FILES=$(curl -s -H "Authorization: token $GH_PAT" \
+                       -H "Accept: application/vnd.github.v3+json" \
+                       "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar" | \
+                  jq -r '.[].name')
+          
+          for file in $FILES; do
+            echo "  📄 Baixando $file..."
+            curl -H "Authorization: token $GH_PAT" \
+                 -H "Accept: application/vnd.github.v3.raw" \
+                 -o "analisar/$file" \
+                 "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/$file"
+          done
+          
+          echo "✅ Todos os arquivos baixados!"
+          ls -la
+          ls -la analisar/
+
+      - name: 📹 Baixar VOD da Twitch
+        run: |
+          echo "📹 Baixando VOD: ${{ github.event.inputs.vod_link }}"
+          yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+                 --merge-output-format mp4 \
+                 -o "vod.mp4" \
+                 "${{ github.event.inputs.vod_link }}"
+          
+          echo "✅ VOD baixado!"
+          ls -lh vod.mp4
+
+      - name: 🎬 Processar Clipes e Fazer Upload
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import sys
+          import json
+          import time
+          import pickle
+          import base64
+          import subprocess
+          import requests
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          from playwright.sync_api import sync_playwright
+
+          # ==================== CONFIGURAÇÕES ====================
+          VOD_FILE = "vod.mp4"
+          CLIPS_DIR = "clips"
+          THUMBNAILS_DIR = "thumbnails"
+          SCREENSHOTS_DIR = "screenshots"
+          EMAIL_ADDRESS = "expulsion-flip-elk@duck.com"
+          GMAIL_TOKEN = "gmail_token.pkl"
+          CHATGPT_URL = "https://chatgpt.com/"
+          HEADLESS = True
+          TIMEOUT = 120000
+
+          os.makedirs(CLIPS_DIR, exist_ok=True)
+          os.makedirs(THUMBNAILS_DIR, exist_ok=True)
+          os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+          # ==================== FUNÇÕES AUXILIARES ====================
+          def time_to_seconds(time_str):
+              """Converte HH:MM:SS para segundos"""
+              parts = time_str.split(':')
+              if len(parts) == 3:
+                  h, m, s = map(int, parts)
+                  return h * 3600 + m * 60 + s
+              elif len(parts) == 2:
+                  m, s = map(int, parts)
+                  return m * 60 + s
+              return int(parts[0])
+
+          def extract_clip(vod_path, start_time, end_time, output_path):
+              """Extrai um clipe do VOD usando ffmpeg"""
+              start_seconds = time_to_seconds(start_time)
+              end_seconds = time_to_seconds(end_time)
+              duration = end_seconds - start_seconds
+              
+              cmd = [
+                  'ffmpeg', '-y',
+                  '-ss', str(start_seconds),
+                  '-i', vod_path,
+                  '-t', str(duration),
+                  '-c:v', 'libx264',
+                  '-preset', 'fast',
+                  '-crf', '18',
+                  '-c:a', 'aac',
+                  '-b:a', '192k',
+                  '-movflags', '+faststart',
+                  output_path
+              ]
+              
+              print(f"   🎬 Extraindo clipe: {start_time} -> {end_time}")
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              
+              if result.returncode != 0:
+                  print(f"   ❌ Erro ffmpeg: {result.stderr}")
+                  return False
+              return True
+
+          def extract_screenshot(vod_path, timestamp, output_path):
+              """Extrai uma screenshot do VOD"""
+              seconds = time_to_seconds(timestamp)
+              
+              cmd = [
+                  'ffmpeg', '-y',
+                  '-ss', str(seconds),
+                  '-i', vod_path,
+                  '-vframes', '1',
+                  '-q:v', '2',
+                  output_path
+              ]
+              
+              print(f"   📸 Extraindo screenshot em: {timestamp}")
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              
+              if result.returncode != 0:
+                  print(f"   ❌ Erro screenshot: {result.stderr}")
+                  return False
+              return True
+
+          # ==================== GMAIL API ====================
+          def get_gmail_service():
+              """Carrega credenciais do Gmail"""
+              if not os.path.exists(GMAIL_TOKEN):
+                  raise FileNotFoundError(f"❌ Arquivo '{GMAIL_TOKEN}' não encontrado!")
+              
+              with open(GMAIL_TOKEN, 'rb') as token:
+                  creds = pickle.load(token)
+              
+              if creds and creds.expired and creds.refresh_token:
+                  print("🔄 Renovando token do Gmail...")
+                  creds.refresh(Request())
+                  with open(GMAIL_TOKEN, 'wb') as token:
+                      pickle.dump(creds, token)
+              
+              return build('gmail', 'v1', credentials=creds)
+
+          def get_chatgpt_code(service, max_attempts=60, interval=3):
+              """Aguarda e extrai o código de verificação do ChatGPT"""
+              print("📧 Aguardando email com código do ChatGPT...")
+              
+              start_time = datetime.now(timezone.utc)
+              
+              for attempt in range(max_attempts):
+                  print(f"   Tentativa {attempt + 1}/{max_attempts}...", end="\r")
+                  
+                  query = "from:noreply@tm.openai.com subject:Your ChatGPT code is"
+                  results = service.users().messages().list(
+                      userId='me',
+                      q=query,
+                      maxResults=5
+                  ).execute()
+                  
+                  messages = results.get('messages', [])
+                  
+                  for msg in messages:
+                      message = service.users().messages().get(
+                          userId='me',
+                          id=msg['id'],
+                          format='full'
+                      ).execute()
+                      
+                      internal_date = int(message.get('internalDate', 0)) / 1000
+                      email_time = datetime.fromtimestamp(internal_date, tz=timezone.utc)
+                      
+                      if email_time < start_time:
+                          continue
+                      
+                      headers = message['payload'].get('headers', [])
+                      subject = next(
+                          (h['value'] for h in headers if h['name'].lower() == 'subject'),
+                          ''
+                      )
+                      
+                      match = re.search(r'Your ChatGPT code is (\d{6})', subject)
+                      if match:
+                          code = match.group(1)
+                          print(f"\n✅ Código encontrado: {code}")
+                          return code
+                  
+                  time.sleep(interval)
+              
+              raise TimeoutError("❌ Tempo esgotado aguardando o email com o código.")
+
+          # ==================== YOUTUBE API ====================
+          def get_youtube_service(pkl_path):
+              """Carrega credenciais do YouTube de um arquivo pkl"""
+              with open(pkl_path, 'rb') as f:
+                  creds = pickle.load(f)
+              
+              if creds and creds.expired and creds.refresh_token:
+                  print("🔄 Renovando token do YouTube...")
+                  creds.refresh(Request())
+                  with open(pkl_path, 'wb') as f:
+                      pickle.dump(creds, f)
+              
+              return build('youtube', 'v3', credentials=creds)
+
+          def upload_to_youtube(youtube, video_path, title, description, tags, thumbnail_path=None):
+              """Faz upload do vídeo para o YouTube como privado"""
+              body = {
+                  'snippet': {
+                      'title': title[:100],
+                      'description': description[:5000],
+                      'tags': tags[:500] if tags else [],
+                      'categoryId': '22'  # People & Blogs
+                  },
+                  'status': {
+                      'privacyStatus': 'private',
+                      'selfDeclaredMadeForKids': False
+                  }
+              }
+              
+              media = MediaFileUpload(
+                  video_path,
+                  mimetype='video/mp4',
+                  resumable=True,
+                  chunksize=1024*1024
+              )
+              
+              print(f"   📤 Iniciando upload: {title}")
+              
+              request = youtube.videos().insert(
+                  part=','.join(body.keys()),
+                  body=body,
+                  media_body=media
+              )
+              
+              response = None
+              while response is None:
+                  status, response = request.next_chunk()
+                  if status:
+                      print(f"   📊 Progresso: {int(status.progress() * 100)}%")
+              
+              video_id = response['id']
+              print(f"   ✅ Upload concluído! ID: {video_id}")
+              
+              # Upload da thumbnail
+              if thumbnail_path and os.path.exists(thumbnail_path):
+                  try:
+                      print(f"   🖼️ Enviando thumbnail...")
+                      youtube.thumbnails().set(
+                          videoId=video_id,
+                          media_body=MediaFileUpload(thumbnail_path)
+                      ).execute()
+                      print(f"   ✅ Thumbnail enviada!")
+                  except Exception as e:
+                      print(f"   ⚠️ Erro ao enviar thumbnail: {e}")
+              
+              return video_id
+
+          # ==================== CHATGPT THUMBNAIL GENERATOR ====================
+          def generate_thumbnail(screenshot_path, clip_info, gmail_service):
+              """Gera thumbnail usando ChatGPT"""
+              print(f"\n🎨 Gerando thumbnail para: {clip_info['title']}")
+              
+              # Cria o prompt com informações do clipe
+              clip_json = json.dumps(clip_info, indent=2, ensure_ascii=False)
+              prompt = f"transforme em uma thumbnail para youtube(1280x720), esse é o clipe:\n{clip_json}"
+              
+              thumbnail_path = os.path.join(
+                  THUMBNAILS_DIR, 
+                  f"thumb_{clip_info['clip_id']}.png"
+              )
+              
+              with sync_playwright() as p:
+                  print("🌐 Iniciando navegador...")
+                  browser = p.chromium.launch(
+                      headless=HEADLESS,
+                      args=[
+                          '--disable-blink-features=AutomationControlled',
+                          '--no-sandbox',
+                          '--disable-dev-shm-usage',
+                          '--disable-gpu',
+                      ]
+                  )
+                  
+                  context = browser.new_context(
+                      viewport={'width': 1920, 'height': 1080},
+                      accept_downloads=True,
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                      locale='en-US',
+                  )
+                  
+                  page = context.new_page()
+                  page.set_default_timeout(TIMEOUT)
+                  
+                  try:
+                      # ETAPA 1: LOGIN
+                      print("🔗 Acessando ChatGPT...")
+                      page.goto(CHATGPT_URL, wait_until='networkidle', timeout=60000)
+                      time.sleep(3)
+                      
+                      # Verifica se precisa fazer login
+                      login_needed = False
+                      try:
+                          login_button = page.locator('[data-testid="login-button"]')
+                          if login_button.is_visible(timeout=5000):
+                              login_needed = True
+                      except:
+                          pass
+                      
+                      if login_needed:
+                          print("🔐 Fazendo login...")
+                          login_button = page.locator('[data-testid="login-button"]')
+                          login_button.click()
+                          
+                          email_input = page.locator('input[name="email"]')
+                          email_input.wait_for(state='visible', timeout=15000)
+                          email_input.fill(EMAIL_ADDRESS)
+                          
+                          continue_button = page.locator('button[type="submit"]:has-text("Continue")')
+                          continue_button.click()
+                          
+                          # Aguarda código
+                          code = get_chatgpt_code(gmail_service)
+                          
+                          code_input = page.locator('input[name="code"]')
+                          code_input.wait_for(state='visible', timeout=15000)
+                          code_input.fill(code)
+                          
+                          validate_button = page.locator('button[name="intent"][value="validate"]')
+                          validate_button.click()
+                          
+                          page.wait_for_url("**/", timeout=30000)
+                          time.sleep(5)
+                          print("✅ Login realizado!")
+                      
+                      # ETAPA 2: CRIAR IMAGEM
+                      print("📌 Selecionando 'Create image'...")
+                      page.goto(CHATGPT_URL, wait_until='domcontentloaded')
+                      time.sleep(3)
+                      
+                      plus_btn = page.locator('[data-testid="composer-plus-btn"]')
+                      plus_btn.wait_for(state="visible", timeout=15000)
+                      plus_btn.click()
+                      time.sleep(1)
+                      
+                      create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
+                      create_image_btn.wait_for(state="visible", timeout=5000)
+                      create_image_btn.click()
+                      time.sleep(2)
+                      
+                      # ETAPA 3: ADICIONAR IMAGEM
+                      print("📌 Adicionando screenshot...")
+                      
+                      # Tenta via input file
+                      try:
+                          file_input = page.locator('input[type="file"]').first
+                          file_input.set_input_files(screenshot_path)
+                          print("   ✅ Imagem adicionada!")
+                          time.sleep(2)
+                      except Exception as e:
+                          print(f"   ⚠️ Tentando método alternativo: {e}")
+                          
+                          # Tenta via drag and drop
+                          with open(screenshot_path, 'rb') as f:
+                              file_content = base64.b64encode(f.read()).decode()
+                          
+                          file_name = os.path.basename(screenshot_path)
+                          
+                          page.evaluate(f'''
+                              () => {{
+                                  const base64 = "{file_content}";
+                                  const binaryString = atob(base64);
+                                  const bytes = new Uint8Array(binaryString.length);
+                                  for (let i = 0; i < binaryString.length; i++) {{
+                                      bytes[i] = binaryString.charCodeAt(i);
+                                  }}
+                                  const blob = new Blob([bytes], {{ type: 'image/png' }});
+                                  const file = new File([blob], '{file_name}', {{ type: 'image/png' }});
+                                  
+                                  const target = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
+                                  if (!target) return false;
+                                  
+                                  const dataTransfer = new DataTransfer();
+                                  dataTransfer.items.add(file);
+                                  
+                                  ['dragenter', 'dragover', 'drop'].forEach(eventType => {{
+                                      const event = new DragEvent(eventType, {{
+                                          bubbles: true,
+                                          cancelable: true,
+                                          dataTransfer: dataTransfer
+                                      }});
+                                      target.dispatchEvent(event);
+                                  }});
+                                  
+                                  return true;
+                              }}
+                          ''')
+                          time.sleep(3)
+                      
+                      # ETAPA 4: INSERIR PROMPT
+                      print("📌 Inserindo prompt...")
+                      time.sleep(1)
+                      
+                      # Escapa o prompt para JavaScript
+                      prompt_escaped = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                      
+                      textarea = page.locator('#prompt-textarea')
+                      textarea.wait_for(state="visible", timeout=5000)
+                      textarea.click()
+                      time.sleep(0.5)
+                      
+                      page.evaluate(f'''
+                          () => {{
+                              const textarea = document.querySelector('#prompt-textarea');
+                              if (!textarea) return;
+                              
+                              const p = textarea.querySelector('p');
+                              if (p) {{
+                                  p.innerHTML = "{prompt_escaped}";
+                              }} else {{
+                                  textarea.innerHTML = "<p>{prompt_escaped}</p>";
+                              }}
+                              
+                              textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                              textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                          }}
+                      ''')
+                      time.sleep(1)
+                      
+                      # ETAPA 5: ENVIAR
+                      print("📌 Enviando...")
+                      send_btn = page.locator('#composer-submit-button')
+                      send_btn.wait_for(state="visible", timeout=5000)
+                      send_btn.click()
+                      
+                      # ETAPA 6: AGUARDAR GERAÇÃO
+                      print("⏳ Aguardando geração (4 minutos)...")
+                      time.sleep(240)
+                      
+                      # ETAPA 7: BAIXAR IMAGEM
+                      print("📌 Baixando thumbnail gerada...")
+                      
+                      try:
+                          time.sleep(5)
+                          
+                          image_containers = page.locator('div[class*="group/imagegen-image"]').all()
+                          
+                          if len(image_containers) > 0:
+                              last_container = image_containers[-1]
+                              last_container.hover()
+                              time.sleep(1)
+                              
+                              download_btn = last_container.locator('button[aria-label="Download this image"]')
+                              download_btn.wait_for(state="visible", timeout=10000)
+                              
+                              with page.expect_download(timeout=60000) as download_info:
+                                  download_btn.click()
+                              
+                              download = download_info.value
+                              download.save_as(thumbnail_path)
+                              print(f"   ✅ Thumbnail salva: {thumbnail_path}")
+                              
+                          else:
+                              # Tenta extrair URL diretamente
+                              img_url = page.evaluate('''
+                                  () => {
+                                      const containers = document.querySelectorAll('div[class*="group/imagegen-image"]');
+                                      if (containers.length > 0) {
+                                          const lastContainer = containers[containers.length - 1];
+                                          const img = lastContainer.querySelector('img[alt="Generated image"]');
+                                          return img ? img.src : null;
+                                      }
+                                      return null;
+                                  }
+                              ''')
+                              
+                              if img_url:
+                                  cookies = context.cookies()
+                                  cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                                  
+                                  headers = {
+                                      "Cookie": cookie_str,
+                                      "User-Agent": page.evaluate("navigator.userAgent"),
+                                      "Referer": "https://chatgpt.com/"
+                                  }
+                                  
+                                  response = requests.get(img_url, headers=headers)
+                                  if response.status_code == 200:
+                                      with open(thumbnail_path, 'wb') as f:
+                                          f.write(response.content)
+                                      print(f"   ✅ Thumbnail baixada via URL: {thumbnail_path}")
+                                  else:
+                                      print("   ❌ Falha no download")
+                                      thumbnail_path = None
+                              else:
+                                  print("   ❌ Nenhuma imagem encontrada")
+                                  thumbnail_path = None
+                                  
+                      except Exception as e:
+                          print(f"   ❌ Erro ao baixar thumbnail: {e}")
+                          thumbnail_path = None
+                      
+                  except Exception as e:
+                      print(f"❌ Erro na geração de thumbnail: {e}")
+                      page.screenshot(path=f'error_{clip_info["clip_id"]}.png')
+                      thumbnail_path = None
+                  
+                  finally:
+                      browser.close()
+              
+              return thumbnail_path if thumbnail_path and os.path.exists(thumbnail_path) else None
+
+          # ==================== MAIN ====================
+          def main():
+              print("=" * 70)
+              print("   YOUTUBE CLIPPER - VOD TO CLIPS")
+              print("=" * 70)
+              
+              # Carregar análise
+              print("\n📄 Carregando analise_resultado.json...")
+              with open('analise_resultado.json', 'r', encoding='utf-8') as f:
+                  analise = json.load(f)
+              
+              # Filtrar apenas clipes do YouTube
+              youtube_clips = [c for c in analise.get('clips', []) if c.get('platform') == 'youtube']
+              print(f"   📹 {len(youtube_clips)} clipes do YouTube encontrados")
+              
+              if not youtube_clips:
+                  print("❌ Nenhum clipe do YouTube encontrado!")
+                  return
+              
+              # Carregar credenciais do YouTube
+              print("\n🔑 Carregando credenciais do YouTube...")
+              youtube_credentials = []
+              
+              for file in os.listdir('analisar'):
+                  if file.endswith('.json'):
+                      filepath = os.path.join('analisar', file)
+                      with open(filepath, 'r', encoding='utf-8') as f:
+                          cred_data = json.load(f)
+                          if 'pkl_file' in cred_data:
+                              youtube_credentials.append(cred_data)
+              
+              print(f"   🔐 {len(youtube_credentials)} credenciais encontradas")
+              
+              if not youtube_credentials:
+                  print("❌ Nenhuma credencial do YouTube encontrada!")
+                  return
+              
+              # Baixar arquivos pkl do YouTube
+              print("\n📥 Baixando arquivos pkl do YouTube...")
+              gh_token = os.environ.get('GH_PAT')
+              
+              for cred in youtube_credentials:
+                  pkl_file = cred['pkl_file']
+                  print(f"   📄 Baixando {pkl_file}...")
+                  
+                  url = f"https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/{pkl_file}"
+                  headers = {
+                      'Authorization': f'token {gh_token}',
+                      'Accept': 'application/vnd.github.v3.raw'
+                  }
+                  
+                  response = requests.get(url, headers=headers)
+                  if response.status_code == 200:
+                      with open(os.path.join('analisar', pkl_file), 'wb') as f:
+                          f.write(response.content)
+                      print(f"      ✅ {pkl_file} baixado!")
+                  else:
+                      print(f"      ❌ Erro ao baixar {pkl_file}: {response.status_code}")
+              
+              # Inicializar serviços
+              print("\n📧 Conectando ao Gmail...")
+              try:
+                  gmail_service = get_gmail_service()
+                  print("   ✅ Gmail conectado!")
+              except Exception as e:
+                  print(f"   ⚠️ Gmail não disponível: {e}")
+                  gmail_service = None
+              
+              # Usar a primeira credencial do YouTube
+              cred = youtube_credentials[0]
+              pkl_path = os.path.join('analisar', cred['pkl_file'])
+              
+              print(f"\n🎬 Conectando ao YouTube: {cred['channel_info']['title']}...")
+              youtube_service = get_youtube_service(pkl_path)
+              print("   ✅ YouTube conectado!")
+              
+              # Processar cada clipe
+              print("\n" + "=" * 70)
+              print("   PROCESSANDO CLIPES")
+              print("=" * 70)
+              
+              successful = 0
+              failed = 0
+              
+              for i, clip in enumerate(youtube_clips, 1):
+                  print(f"\n{'─' * 60}")
+                  print(f"📹 Clipe {i}/{len(youtube_clips)}: {clip['title']}")
+                  print(f"   ⏱️  {clip['start_time']} -> {clip['end_time']}")
+                  print(f"{'─' * 60}")
+                  
+                  try:
+                      # Extrair clipe
+                      clip_path = os.path.join(CLIPS_DIR, f"{clip['clip_id']}.mp4")
+                      if not extract_clip(VOD_FILE, clip['start_time'], clip['end_time'], clip_path):
+                          print("   ❌ Falha ao extrair clipe")
+                          failed += 1
+                          continue
+                      
+                      # Extrair screenshot para thumbnail
+                      screenshot_path = os.path.join(SCREENSHOTS_DIR, f"{clip['clip_id']}.png")
+                      thumbnail_timestamp = clip.get('thumbnail_timestamp', clip['start_time'])
+                      
+                      if not extract_screenshot(VOD_FILE, thumbnail_timestamp, screenshot_path):
+                          print("   ⚠️ Falha ao extrair screenshot, continuando sem thumbnail")
+                          screenshot_path = None
+                      
+                      # Gerar thumbnail com ChatGPT
+                      thumbnail_path = None
+                      if screenshot_path and gmail_service:
+                          try:
+                              thumbnail_path = generate_thumbnail(screenshot_path, clip, gmail_service)
+                          except Exception as e:
+                              print(f"   ⚠️ Erro na geração de thumbnail: {e}")
+                      
+                      # Upload para YouTube
+                      print("\n   📤 Fazendo upload para o YouTube...")
+                      
+                      video_id = upload_to_youtube(
+                          youtube_service,
+                          clip_path,
+                          clip['title'],
+                          clip.get('recommended_description', ''),
+                          clip.get('tags', []),
+                          thumbnail_path
+                      )
+                      
+                      print(f"   🎉 Clipe postado! https://youtube.com/watch?v={video_id}")
+                      successful += 1
+                      
+                      # Limpar arquivos temporários para economizar espaço
+                      if os.path.exists(clip_path):
+                          os.remove(clip_path)
+                      if screenshot_path and os.path.exists(screenshot_path):
+                          os.remove(screenshot_path)
+                      if thumbnail_path and os.path.exists(thumbnail_path):
+                          os.remove(thumbnail_path)
+                      
+                  except Exception as e:
+                      print(f"   ❌ Erro ao processar clipe: {e}")
+                      failed += 1
+                      continue
+              
+              # Resumo final
+              print("\n" + "=" * 70)
+              print("   📊 RESUMO FINAL")
+              print("=" * 70)
+              print(f"   ✅ Clipes postados com sucesso: {successful}")
+              print(f"   ❌ Clipes com falha: {failed}")
+              print(f"   📹 Total processado: {successful + failed}")
+              print("=" * 70)
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except KeyboardInterrupt:
+                  print("\n⚠️ Operação cancelada!")
+              except Exception as e:
+                  print(f"\n❌ Erro fatal: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  sys.exit(1)
+          PYTHON_SCRIPT
+
+      - name: 📊 Exibir resultados
+        if: always()
+        run: |
+          echo "=== Arquivos gerados ==="
+          ls -la clips/ 2>/dev/null || echo "Pasta clips vazia"
+          ls -la thumbnails/ 2>/dev/null || echo "Pasta thumbnails vazia"
+          echo "=== Fim ==="
