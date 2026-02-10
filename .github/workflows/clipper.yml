@@ -67,7 +67,7 @@ jobs:
       - name: 📦 Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2
+          sudo apt-get install -y ffmpeg aria2 xvfb
           aria2c --version | head -1
           
       - name: 📦 Instalar dependências Python
@@ -231,7 +231,7 @@ jobs:
 
               with sync_playwright() as p:
                   browser = p.chromium.launch(
-                      headless=True,
+                      headless=False,
                       args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
                   )
                   context = browser.new_context(
@@ -843,6 +843,7 @@ jobs:
                       try:
                           chatgpt_result = subprocess.run(
                               [
+                                  "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
                                   sys.executable, "scripts/chatgpt_thumbnail.py",
                                   "--image", str(screenshot_path),
                                   "--output", str(thumb_path),
