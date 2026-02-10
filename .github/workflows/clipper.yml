@@ -124,6 +124,23 @@ jobs:
           
           echo "✅ Configurações baixadas!"
           ls -la analisar/
+          
+          echo "📥 Baixando emails.txt..."
+          curl -sf -H "Authorization: token $GH_PAT" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o chatgpt_emails.txt \
+               "https://api.github.com/repos/Alisson990jd/apiss/contents/emails.txt" || echo "⚠️ emails.txt não encontrado"
+          
+          echo "📥 Baixando thumbnail_usage.json..."
+          curl -sf -H "Authorization: token $GH_PAT" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o thumbnail_usage.json \
+               "https://api.github.com/repos/Alisson990jd/apiss/contents/thumbnail_usage.json" || echo '{}' > thumbnail_usage.json
+          
+          echo "📧 Emails disponíveis:"
+          cat chatgpt_emails.txt 2>/dev/null || echo "Nenhum"
+          echo "📊 Uso atual:"
+          cat thumbnail_usage.json
 
       - name: 📂 Criar diretórios
         run: |
@@ -157,7 +174,6 @@ jobs:
           logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
           logger = logging.getLogger(__name__)
 
-          EMAIL_ADDRESS = "expulsion-flip-elk@duck.com"
           TOKEN_PICKLE = "gmail_token.pkl"
           CHATGPT_URL = "https://chatgpt.com/"
 
@@ -217,8 +233,8 @@ jobs:
               return False
 
 
-          def generate_thumbnail(image_path, output_path, clip_json_str):
-              logger.info("🎨 Iniciando geração de thumbnail via ChatGPT...")
+          def generate_thumbnail(image_path, output_path, clip_json_str, email_address):
+              logger.info(f"🎨 Iniciando geração de thumbnail via ChatGPT com {email_address}...")
               image_path = os.path.abspath(image_path)
               if not os.path.exists(image_path):
                   logger.error(f"❌ Imagem não encontrada: {image_path}")
@@ -254,7 +270,7 @@ jobs:
                       email_input = page.locator('input[name="email"]')
                       email_input.wait_for(state='visible')
                       time.sleep(0.3)
-                      email_input.fill(EMAIL_ADDRESS)
+                      email_input.fill(email_address)
 
                       continue_button = page.locator('button[type="submit"]:has-text("Continue")')
                       continue_button.wait_for(state='visible')
@@ -435,8 +451,9 @@ jobs:
               parser.add_argument("--image", required=True)
               parser.add_argument("--output", required=True)
               parser.add_argument("--clip-json", required=True)
+              parser.add_argument("--email", required=True, help="Email da conta ChatGPT")
               args = parser.parse_args()
-              success = generate_thumbnail(args.image, args.output, args.clip_json)
+              success = generate_thumbnail(args.image, args.output, args.clip_json, args.email)
               sys.exit(0 if success else 1)
           CHATGPT_EOF
 
@@ -447,7 +464,7 @@ jobs:
           cat > scripts/clip_creator.py << 'SCRIPT_EOF'
           #!/usr/bin/env python3
           """
-          🎬 YouTube Clip Creator - COM THUMBNAIL CORRIGIDA
+          🎬 YouTube Clip Creator - COM THUMBNAIL MULTI-CONTA
           """
 
           import os
@@ -457,8 +474,10 @@ jobs:
           import pickle
           import time
           import logging
+          import base64
+          import requests
           from pathlib import Path
-          from datetime import datetime
+          from datetime import datetime, timezone, timedelta
           from typing import Optional, Dict, List
 
           logging.basicConfig(
@@ -474,6 +493,13 @@ jobs:
           TEMP_DIR = Path("temp_clips")
           THUMB_DIR = Path("thumbnails")
           PROCESSING_LOG = "processing_log.json"
+          EMAILS_FILE = "chatgpt_emails.txt"
+          USAGE_FILE = "thumbnail_usage.json"
+          MAX_THUMBS_PER_ACCOUNT = 3
+          RATE_LIMIT_HOURS = 24
+          GH_PAT = os.environ.get("GH_PAT", "")
+          USAGE_REPO = "Alisson990jd/apiss"
+          USAGE_REPO_PATH = "thumbnail_usage.json"
 
 
           def time_to_seconds(time_str: str) -> int:
@@ -492,6 +518,119 @@ jobs:
               m = (seconds % 3600) // 60
               s = seconds % 60
               return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+          def load_emails() -> List[str]:
+              """Carrega lista de emails do arquivo"""
+              if not os.path.exists(EMAILS_FILE):
+                  logger.error(f"❌ {EMAILS_FILE} não encontrado!")
+                  return []
+              with open(EMAILS_FILE, 'r') as f:
+                  emails = [line.strip() for line in f if line.strip() and '@' in line]
+              logger.info(f"📧 {len(emails)} emails carregados")
+              return emails
+
+
+          def load_usage() -> Dict:
+              """Carrega JSON de uso de thumbnails"""
+              if not os.path.exists(USAGE_FILE):
+                  return {}
+              try:
+                  with open(USAGE_FILE, 'r') as f:
+                      return json.load(f)
+              except (json.JSONDecodeError, Exception):
+                  return {}
+
+
+          def save_usage(usage: Dict):
+              """Salva JSON de uso localmente"""
+              with open(USAGE_FILE, 'w') as f:
+                  json.dump(usage, f, indent=2, ensure_ascii=False)
+
+
+          def sync_usage_to_github(usage: Dict) -> bool:
+              """Faz push do thumbnail_usage.json para o repo apiss via GitHub API"""
+              if not GH_PAT:
+                  logger.warning("⚠️ GH_PAT não definido, não é possível sincronizar")
+                  return False
+              
+              try:
+                  # Pegar SHA atual do arquivo (necessário para update)
+                  headers = {
+                      "Authorization": f"token {GH_PAT}",
+                      "Accept": "application/vnd.github.v3+json"
+                  }
+                  url = f"https://api.github.com/repos/{USAGE_REPO}/contents/{USAGE_REPO_PATH}"
+                  
+                  resp = requests.get(url, headers=headers)
+                  sha = None
+                  if resp.status_code == 200:
+                      sha = resp.json().get("sha")
+                  
+                  # Preparar conteúdo
+                  content_str = json.dumps(usage, indent=2, ensure_ascii=False)
+                  content_b64 = base64.b64encode(content_str.encode()).decode()
+                  
+                  body = {
+                      "message": f"update thumbnail usage - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                      "content": content_b64
+                  }
+                  if sha:
+                      body["sha"] = sha
+                  
+                  resp = requests.put(url, headers=headers, json=body)
+                  if resp.status_code in (200, 201):
+                      logger.info("   ✅ thumbnail_usage.json sincronizado com GitHub")
+                      return True
+                  else:
+                      logger.warning(f"   ⚠️ Falha ao sincronizar: {resp.status_code} - {resp.text[:200]}")
+                      return False
+              except Exception as e:
+                  logger.warning(f"   ⚠️ Erro ao sincronizar: {e}")
+                  return False
+
+
+          def get_available_email(emails: List[str], usage: Dict) -> Optional[str]:
+              """Retorna o próximo email com cota disponível (< 3 nas últimas 24h)"""
+              now = datetime.now(timezone.utc)
+              cutoff = now - timedelta(hours=RATE_LIMIT_HOURS)
+              
+              for email in emails:
+                  account = usage.get(email, {})
+                  history = account.get("history", [])
+                  
+                  # Filtrar apenas usos nas últimas 24h
+                  recent = [ts for ts in history if datetime.fromisoformat(ts) > cutoff]
+                  
+                  if len(recent) < MAX_THUMBS_PER_ACCOUNT:
+                      logger.info(f"   📧 Email disponível: {email} ({len(recent)}/{MAX_THUMBS_PER_ACCOUNT} usados)")
+                      return email
+                  else:
+                      logger.info(f"   ⏳ Email esgotado: {email} ({len(recent)}/{MAX_THUMBS_PER_ACCOUNT})")
+              
+              return None
+
+
+          def record_usage(email: str, usage: Dict) -> Dict:
+              """Registra uso bem-sucedido de uma conta"""
+              now = datetime.now(timezone.utc).isoformat()
+              cutoff = datetime.now(timezone.utc) - timedelta(hours=RATE_LIMIT_HOURS)
+              
+              if email not in usage:
+                  usage[email] = {"count": 0, "history": []}
+              
+              # Limpar histórico antigo (> 24h)
+              usage[email]["history"] = [
+                  ts for ts in usage[email].get("history", [])
+                  if datetime.fromisoformat(ts) > cutoff
+              ]
+              
+              # Adicionar novo uso
+              usage[email]["history"].append(now)
+              usage[email]["count"] = len(usage[email]["history"])
+              usage[email]["last_used"] = now
+              
+              return usage
 
 
           def load_clips_config() -> List[Dict]:
@@ -836,48 +975,67 @@ jobs:
                   screenshot_path = THUMB_DIR / f"{clip_id}_screenshot.png"
                   screenshot_ok = capture_thumbnail(video_path, rel_thumb, screenshot_path)
                   
-                  # 3. Gera thumbnail via ChatGPT (retry infinito até conseguir)
+                  # 3. Gera thumbnail via ChatGPT (com rotação de contas)
                   thumb_success = False
                   if screenshot_ok and screenshot_path.exists():
-                      attempt = 0
-                      while True:
-                          attempt += 1
-                          logger.info(f"   🎨 Gerando thumbnail via ChatGPT... (tentativa {attempt})")
-                          clip_json_str = json.dumps(clip_data, ensure_ascii=False, indent=2)
-                          try:
-                              chatgpt_result = subprocess.run(
-                                  [
-                                      "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
-                                      sys.executable, "scripts/chatgpt_thumbnail.py",
-                                      "--image", str(screenshot_path),
-                                      "--output", str(thumb_path),
-                                      "--clip-json", clip_json_str
-                                  ],
-                                  capture_output=True, text=True, timeout=600
-                              )
-                              if chatgpt_result.returncode == 0 and thumb_path.exists():
-                                  thumb_success = True
-                                  result["thumbnail_status"] = "chatgpt_generated"
-                                  logger.info(f"   ✅ Thumbnail gerada via ChatGPT! (tentativa {attempt})")
-                                  break
-                              else:
-                                  logger.warning(f"   ⚠️ ChatGPT falhou (tentativa {attempt}), tentando novamente...")
-                                  logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
-                                  logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
-                          except subprocess.TimeoutExpired:
-                              logger.warning(f"   ⚠️ ChatGPT timeout (tentativa {attempt}), tentando novamente...")
-                          except Exception as e:
-                              logger.warning(f"   ⚠️ ChatGPT erro (tentativa {attempt}): {e}, tentando novamente...")
+                      # Carregar emails e uso
+                      emails = load_emails()
+                      usage = load_usage()
+                      
+                      if not emails:
+                          logger.warning("   ⚠️ Nenhum email disponível, pulando thumbnail")
+                          result["thumbnail_status"] = "no_emails"
+                      else:
+                          # Tentar com email disponível
+                          email = get_available_email(emails, usage)
                           
-                          # Limpar thumb corrompida se existir
-                          try:
-                              if thumb_path.exists():
-                                  thumb_path.unlink()
-                          except:
-                              pass
-                          
-                          logger.info(f"   🔄 Aguardando 10s antes de tentar novamente...")
-                          time.sleep(10)
+                          if not email:
+                              logger.warning("   ⚠️ Todos os emails atingiram o limite de 3 thumbs/24h")
+                              result["thumbnail_status"] = "rate_limited"
+                          else:
+                              logger.info(f"   🎨 Gerando thumbnail via ChatGPT com {email}...")
+                              clip_json_str = json.dumps(clip_data, ensure_ascii=False, indent=2)
+                              try:
+                                  chatgpt_result = subprocess.run(
+                                      [
+                                          "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
+                                          sys.executable, "scripts/chatgpt_thumbnail.py",
+                                          "--image", str(screenshot_path),
+                                          "--output", str(thumb_path),
+                                          "--clip-json", clip_json_str,
+                                          "--email", email
+                                      ],
+                                      capture_output=True, text=True, timeout=600
+                                  )
+                                  if chatgpt_result.returncode == 0 and thumb_path.exists():
+                                      thumb_success = True
+                                      result["thumbnail_status"] = "chatgpt_generated"
+                                      logger.info(f"   ✅ Thumbnail gerada via ChatGPT com {email}!")
+                                      
+                                      # Registrar uso e sincronizar com GitHub
+                                      usage = record_usage(email, usage)
+                                      save_usage(usage)
+                                      sync_usage_to_github(usage)
+                                      logger.info(f"   📊 Uso atualizado: {email} -> {usage[email]['count']}/{MAX_THUMBS_PER_ACCOUNT}")
+                                  else:
+                                      logger.warning(f"   ⚠️ ChatGPT falhou com {email}, pulando thumbnail")
+                                      logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
+                                      logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
+                                      result["thumbnail_status"] = "failed"
+                              except subprocess.TimeoutExpired:
+                                  logger.warning(f"   ⚠️ ChatGPT timeout com {email}, pulando thumbnail")
+                                  result["thumbnail_status"] = "timeout"
+                              except Exception as e:
+                                  logger.warning(f"   ⚠️ ChatGPT erro com {email}: {e}, pulando thumbnail")
+                                  result["thumbnail_status"] = "error"
+                              
+                              # Limpar thumb corrompida se existir e não foi sucesso
+                              if not thumb_success:
+                                  try:
+                                      if thumb_path.exists():
+                                          thumb_path.unlink()
+                                  except:
+                                      pass
                   else:
                       result["thumbnail_status"] = "failed"
                       logger.warning(f"   ⚠️ Screenshot não capturado, sem thumbnail")
@@ -1034,6 +1192,7 @@ jobs:
       - name: 🎬 Processar Clipes
         env:
           VOD_LINK: ${{ github.event.inputs.vod_link }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python scripts/clip_creator.py "$VOD_LINK"
 
