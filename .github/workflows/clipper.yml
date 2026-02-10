@@ -1,15 +1,14 @@
-# .github/workflows/youtube-clipper.yml
-name: YouTube Clipper - VOD to Clips
+name: 🎬 Criar Clipes para YouTube
 
 on:
   workflow_dispatch:
     inputs:
-      vod_link:
-        description: 'Link do VOD da Twitch'
+      vod_url:
+        description: 'URL do VOD da Twitch'
         required: true
         type: string
       senha:
-        description: 'Senha para executar'
+        description: 'Senha de Execução'
         required: true
         type: string
 
@@ -22,12 +21,12 @@ jobs:
       - name: 🔐 Validar Senha
         run: |
           if [ "${{ github.event.inputs.senha }}" != "${{ secrets.SENHA }}" ]; then
-            echo "❌ Senha incorreta!"
+            echo "❌ Senha inválida!"
             exit 1
           fi
           echo "✅ Senha validada com sucesso!"
 
-      - name: 📥 Checkout do repositório
+      - name: 📥 Checkout do Repositório
         uses: actions/checkout@v4
 
       - name: 🐍 Configurar Python
@@ -35,343 +34,251 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 📦 Instalar dependências do sistema
+      - name: 📦 Instalar Dependências do Sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq
+          sudo apt-get install -y ffmpeg
           
-      - name: 🎭 Instalar Playwright
-        run: |
-          pip install playwright
-          playwright install chromium
-          playwright install-deps chromium
-
-      - name: 📦 Instalar dependências Python
+      - name: 📦 Instalar Dependências Python
         run: |
           pip install --upgrade pip
-          pip install requests google-auth google-auth-oauthlib google-api-python-client
-          pip install yt-dlp httpx aiohttp pillow
-          pip install playwright
+          pip install yt-dlp google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          pip install playwright requests pillow
+          playwright install chromium
+          playwright install-deps
 
-      - name: 📥 Baixar arquivos do repositório externo
+      - name: 📥 Baixar Arquivos do Repositório Externo
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          # Criar diretórios
+          mkdir -p config_data
+          mkdir -p youtube_accounts
+          
+          # Baixar analise_resultado.json
           echo "📥 Baixando analise_resultado.json..."
-          curl -H "Authorization: token $GH_PAT" \
+          curl -H "Authorization: token $GH_TOKEN" \
                -H "Accept: application/vnd.github.v3.raw" \
-               -o analise_resultado.json \
-               "https://api.github.com/repos/Alisson990jd/apiss/contents/analise_resultado.json"
+               -o config_data/analise_resultado.json \
+               https://raw.githubusercontent.com/Alisson990jd/apiss/main/analise_resultado.json
           
+          # Baixar gmail_token.pkl
           echo "📥 Baixando gmail_token.pkl..."
-          curl -H "Authorization: token $GH_PAT" \
+          curl -H "Authorization: token $GH_TOKEN" \
                -H "Accept: application/vnd.github.v3.raw" \
-               -o gmail_token.pkl \
-               "https://api.github.com/repos/Alisson990jd/apiss/contents/gmail_token.pkl"
+               -o config_data/gmail_token.pkl \
+               https://raw.githubusercontent.com/Alisson990jd/apiss/main/gmail_token.pkl
           
-          echo "📥 Baixando arquivos da pasta analisar..."
-          mkdir -p analisar
+          # Listar arquivos JSON da pasta analisar
+          echo "📥 Baixando arquivos de autenticação do YouTube..."
           
-          # Listar e baixar todos os arquivos (JSON e PKL)
-          FILES=$(curl -s -H "Authorization: token $GH_PAT" \
-                       -H "Accept: application/vnd.github.v3+json" \
-                       "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar" | \
-                  jq -r '.[].name')
+          # Usar API do GitHub para listar arquivos
+          curl -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               https://api.github.com/repos/Alisson990jd/apiss/contents/analisar > files_list.json
           
-          for file in $FILES; do
-            echo "  📄 Baixando $file..."
-            curl -H "Authorization: token $GH_PAT" \
-                 -H "Accept: application/vnd.github.v3.raw" \
-                 -o "analisar/$file" \
-                 "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/$file"
+          # Baixar cada arquivo JSON
+          cat files_list.json | grep -o '"download_url": "[^"]*"' | sed 's/"download_url": "\(.*\)"/\1/' | while read url; do
+            if [[ $url == *.json ]]; then
+              filename=$(basename $url)
+              echo "  📄 Baixando $filename..."
+              curl -H "Authorization: token $GH_TOKEN" -o "youtube_accounts/$filename" "$url"
+            fi
           done
           
+          rm files_list.json
+          
           echo "✅ Todos os arquivos baixados!"
-          ls -la
-          ls -la analisar/
+          echo "📊 Arquivos de contas YouTube: $(ls -1 youtube_accounts/*.json | wc -l)"
 
-      - name: 🎬 Processar Clipes e Fazer Upload
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          VOD_URL: ${{ github.event.inputs.vod_link }}
+      - name: 🎬 Criar Scripts de Processamento
         run: |
-          python3 << 'PYTHON_SCRIPT'
+          cat > process_clips.py << 'PYTHON_SCRIPT_EOF'
           import os
-          import sys
           import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          VOD_URL = "${{ github.event.inputs.vod_url }}"
+          ANALISE_FILE = "config_data/analise_resultado.json"
+          TEMP_DIR = Path("temp_processing")
+          TEMP_DIR.mkdir(exist_ok=True)
+
+          def load_clips():
+              """Carrega e filtra clipes do YouTube"""
+              print("📂 Carregando arquivo de análise...")
+              with open(ANALISE_FILE, 'r', encoding='utf-8') as f:
+                  data = json.load(f)
+              
+              youtube_clips = [c for c in data.get('clips', []) if c.get('platform') == 'youtube']
+              print(f"✅ {len(youtube_clips)} clipes do YouTube encontrados")
+              return youtube_clips
+
+          def download_clip_segment(vod_url, start_time, end_time, output_file):
+              """Baixa apenas o segmento específico do VOD"""
+              print(f"📥 Baixando segmento: {start_time} -> {end_time}")
+              
+              # Converter tempo para segundos
+              def time_to_seconds(time_str):
+                  parts = time_str.split(':')
+                  return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+              
+              start_sec = time_to_seconds(start_time)
+              end_sec = time_to_seconds(end_time)
+              duration = end_sec - start_sec
+              
+              cmd = [
+                  'yt-dlp',
+                  '--force-keyframes-at-cuts',
+                  '--download-sections', f'*{start_time}-{end_time}',
+                  '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                  '--merge-output-format', 'mp4',
+                  '-o', str(output_file),
+                  '--no-playlist',
+                  '--concurrent-fragments', '8',
+                  vod_url
+              ]
+              
+              try:
+                  result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                  print(f"✅ Download concluído: {output_file}")
+                  return True
+              except subprocess.CalledProcessError as e:
+                  print(f"❌ Erro no download: {e}")
+                  print(f"STDOUT: {e.stdout}")
+                  print(f"STDERR: {e.stderr}")
+                  return False
+
+          def capture_thumbnail_frame(vod_url, timestamp, output_file):
+              """Captura frame do vídeo no timestamp especificado"""
+              print(f"📸 Capturando frame em {timestamp}...")
+              
+              cmd = [
+                  'ffmpeg',
+                  '-ss', timestamp,
+                  '-i', vod_url,
+                  '-vframes', '1',
+                  '-q:v', '2',
+                  '-y',
+                  str(output_file)
+              ]
+              
+              try:
+                  subprocess.run(cmd, check=True, capture_output=True)
+                  print(f"✅ Frame capturado: {output_file}")
+                  return True
+              except subprocess.CalledProcessError as e:
+                  print(f"❌ Erro ao capturar frame: {e}")
+                  return False
+
+          def main():
+              clips = load_clips()
+              
+              if not clips:
+                  print("⚠️ Nenhum clipe do YouTube para processar")
+                  return
+              
+              # Salvar informações dos clipes para processamento posterior
+              clips_info = []
+              
+              for idx, clip in enumerate(clips, 1):
+                  print(f"\n{'='*60}")
+                  print(f"📹 PROCESSANDO CLIPE {idx}/{len(clips)}")
+                  print(f"{'='*60}")
+                  print(f"🎬 Título: {clip['title']}")
+                  print(f"⏱️  Duração: {clip['duration_seconds']}s")
+                  print(f"📍 Tempo: {clip['start_time']} -> {clip['end_time']}")
+                  
+                  clip_id = clip['clip_id']
+                  video_file = TEMP_DIR / f"{clip_id}.mp4"
+                  thumbnail_base = TEMP_DIR / f"{clip_id}_base.jpg"
+                  thumbnail_final = TEMP_DIR / f"{clip_id}_thumbnail.png"
+                  
+                  # 1. Capturar frame para thumbnail
+                  if not capture_thumbnail_frame(VOD_URL, clip['thumbnail_timestamp'], thumbnail_base):
+                      print(f"⚠️ Pulando clipe {clip_id} - erro ao capturar thumbnail")
+                      continue
+                  
+                  # 2. Baixar segmento do vídeo
+                  if not download_clip_segment(VOD_URL, clip['start_time'], clip['end_time'], video_file):
+                      print(f"⚠️ Pulando clipe {clip_id} - erro no download")
+                      continue
+                  
+                  # Verificar se arquivo existe
+                  if not video_file.exists():
+                      print(f"⚠️ Arquivo {video_file} não foi criado")
+                      continue
+                  
+                  file_size = video_file.stat().st_size / (1024*1024)
+                  print(f"✅ Vídeo baixado: {file_size:.2f} MB")
+                  
+                  # Salvar informações para próximas etapas
+                  clips_info.append({
+                      'clip': clip,
+                      'video_file': str(video_file),
+                      'thumbnail_base': str(thumbnail_base),
+                      'thumbnail_final': str(thumbnail_final),
+                      'index': idx,
+                      'total': len(clips)
+                  })
+              
+              # Salvar informações dos clipes processados
+              with open('clips_to_upload.json', 'w', encoding='utf-8') as f:
+                  json.dump(clips_info, f, indent=2, ensure_ascii=False)
+              
+              print(f"\n✅ {len(clips_info)} clipes prontos para upload!")
+
+          if __name__ == '__main__':
+              main()
+          PYTHON_SCRIPT_EOF
+
+          cat > generate_thumbnails.py << 'PYTHON_SCRIPT_EOF'
+          import os
+          import re
           import time
           import pickle
           import base64
-          import subprocess
+          import json
           import requests
-          import re
-          import shutil
           from datetime import datetime, timezone
           from pathlib import Path
           from google.auth.transport.requests import Request
           from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import sync_playwright, Page, Browser
 
-          # ==================== CONFIGURAÇÕES ====================
-          VOD_URL = os.environ.get('VOD_URL')
-          WORK_DIR = "temp_work"
+          # Configurações
           EMAIL_ADDRESS = "expulsion-flip-elk@duck.com"
-          GMAIL_TOKEN = "gmail_token.pkl"
+          TOKEN_PICKLE = "config_data/gmail_token.pkl"
           CHATGPT_URL = "https://chatgpt.com/"
           HEADLESS = True
-          TIMEOUT = 120000
+          TIMEOUT = 60000
+          CLIPS_INFO_FILE = "clips_to_upload.json"
 
-          # Criar diretório de trabalho
-          os.makedirs(WORK_DIR, exist_ok=True)
-
-          # ==================== FUNÇÕES AUXILIARES ====================
-          def time_to_seconds(time_str):
-              """Converte HH:MM:SS para segundos"""
-              parts = time_str.split(':')
-              if len(parts) == 3:
-                  h, m, s = parts
-                  # Trata caso tenha decimais nos segundos
-                  h = int(h)
-                  m = int(m)
-                  s = float(s)
-                  return h * 3600 + m * 60 + s
-              elif len(parts) == 2:
-                  m, s = parts
-                  m = int(m)
-                  s = float(s)
-                  return m * 60 + s
-              return float(parts[0])
-
-          def seconds_to_time(seconds):
-              """Converte segundos para HH:MM:SS"""
-              h = int(seconds // 3600)
-              m = int((seconds % 3600) // 60)
-              s = int(seconds % 60)
-              return f"{h:02d}:{m:02d}:{s:02d}"
-
-          def download_clip_segment(vod_url, start_time, end_time, output_path):
-              """Baixa apenas o segmento específico do VOD usando yt-dlp"""
-              start_sec = time_to_seconds(start_time)
-              end_sec = time_to_seconds(end_time)
-              
-              # Adiciona margem de segurança (5 segundos antes e depois)
-              start_sec = max(0, start_sec - 5)
-              end_sec = end_sec + 5
-              
-              # Formato para yt-dlp: *START-END
-              section = f"*{seconds_to_time(start_sec)}-{seconds_to_time(end_sec)}"
-              
-              print(f"   📥 Baixando segmento: {start_time} -> {end_time}")
-              print(f"   📥 Seção com margem: {seconds_to_time(start_sec)} -> {seconds_to_time(end_sec)}")
-              
-              cmd = [
-                  'yt-dlp',
-                  '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                  '--merge-output-format', 'mp4',
-                  '--download-sections', section,
-                  '--force-keyframes-at-cuts',
-                  '-o', output_path,
-                  '--no-playlist',
-                  '--retries', '10',
-                  '--fragment-retries', '10',
-                  '-N', '20',
-                  vod_url
-              ]
-              
-              print(f"   🔧 Comando: {' '.join(cmd)}")
-              
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              
-              if result.returncode != 0:
-                  print(f"   ⚠️ Stderr: {result.stderr}")
-                  # Tenta método alternativo com ffmpeg direto
-                  return download_with_ffmpeg(vod_url, start_sec, end_sec, output_path)
-              
-              if os.path.exists(output_path):
-                  size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                  print(f"   ✅ Segmento baixado: {size_mb:.2f} MB")
-                  return True
-              
-              return False
-
-          def download_with_ffmpeg(vod_url, start_sec, end_sec, output_path):
-              """Método alternativo: usa ffmpeg para baixar diretamente"""
-              print("   🔄 Tentando método alternativo com ffmpeg...")
-              
-              # Primeiro pega a URL direta do stream
-              cmd_url = [
-                  'yt-dlp',
-                  '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                  '-g',
-                  vod_url
-              ]
-              
-              result = subprocess.run(cmd_url, capture_output=True, text=True)
-              
-              if result.returncode != 0:
-                  print(f"   ❌ Erro ao obter URL: {result.stderr}")
-                  return False
-              
-              urls = result.stdout.strip().split('\n')
-              
-              if len(urls) >= 2:
-                  # Video e audio separados
-                  video_url = urls[0]
-                  audio_url = urls[1]
-                  
-                  duration = end_sec - start_sec
-                  
-                  cmd = [
-                      'ffmpeg', '-y',
-                      '-ss', str(start_sec),
-                      '-i', video_url,
-                      '-ss', str(start_sec),
-                      '-i', audio_url,
-                      '-t', str(duration),
-                      '-c:v', 'copy',
-                      '-c:a', 'aac',
-                      '-map', '0:v:0',
-                      '-map', '1:a:0',
-                      '-movflags', '+faststart',
-                      output_path
-                  ]
-              else:
-                  # URL única
-                  stream_url = urls[0]
-                  duration = end_sec - start_sec
-                  
-                  cmd = [
-                      'ffmpeg', '-y',
-                      '-ss', str(start_sec),
-                      '-i', stream_url,
-                      '-t', str(duration),
-                      '-c:v', 'copy',
-                      '-c:a', 'aac',
-                      '-movflags', '+faststart',
-                      output_path
-                  ]
-              
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              
-              if result.returncode != 0:
-                  print(f"   ❌ Erro ffmpeg: {result.stderr[:500]}")
-                  return False
-              
-              if os.path.exists(output_path):
-                  size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                  print(f"   ✅ Segmento baixado via ffmpeg: {size_mb:.2f} MB")
-                  return True
-              
-              return False
-
-          def extract_screenshot(video_path, timestamp, clip_start, output_path):
-              """Extrai uma screenshot do clipe baixado"""
-              # Calcula o timestamp relativo ao clipe
-              clip_start_sec = time_to_seconds(clip_start)
-              thumb_sec = time_to_seconds(timestamp)
-              relative_sec = thumb_sec - clip_start_sec + 5  # +5 pela margem adicionada
-              
-              # Garante que não seja negativo
-              relative_sec = max(0, relative_sec)
-              
-              cmd = [
-                  'ffmpeg', '-y',
-                  '-ss', str(relative_sec),
-                  '-i', video_path,
-                  '-vframes', '1',
-                  '-q:v', '2',
-                  output_path
-              ]
-              
-              print(f"   📸 Extraindo screenshot no segundo {relative_sec:.1f}")
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              
-              if result.returncode != 0:
-                  print(f"   ⚠️ Erro screenshot: {result.stderr[:200]}")
-                  return False
-              
-              if os.path.exists(output_path):
-                  print(f"   ✅ Screenshot extraída!")
-                  return True
-              return False
-
-          def trim_clip(input_path, output_path, start_time, end_time):
-              """Corta o clipe para o tempo exato (remove margens)"""
-              # O clipe baixado tem 5s de margem no início
-              # Vamos cortar para o tempo exato
-              
-              start_sec = 5  # Margem que adicionamos
-              duration = time_to_seconds(end_time) - time_to_seconds(start_time)
-              
-              cmd = [
-                  'ffmpeg', '-y',
-                  '-ss', str(start_sec),
-                  '-i', input_path,
-                  '-t', str(duration),
-                  '-c:v', 'libx264',
-                  '-preset', 'fast',
-                  '-crf', '18',
-                  '-c:a', 'aac',
-                  '-b:a', '192k',
-                  '-movflags', '+faststart',
-                  output_path
-              ]
-              
-              print(f"   ✂️ Cortando para duração exata: {duration}s")
-              result = subprocess.run(cmd, capture_output=True, text=True)
-              
-              if result.returncode != 0:
-                  print(f"   ⚠️ Erro ao cortar: {result.stderr[:200]}")
-                  # Usa o arquivo original se falhar
-                  shutil.copy(input_path, output_path)
-              
-              return os.path.exists(output_path)
-
-          def cleanup_files(*paths):
-              """Remove arquivos temporários"""
-              for path in paths:
-                  if path and os.path.exists(path):
-                      try:
-                          os.remove(path)
-                          print(f"   🗑️ Removido: {os.path.basename(path)}")
-                      except Exception as e:
-                          print(f"   ⚠️ Erro ao remover {path}: {e}")
-
-          def get_disk_usage():
-              """Retorna uso de disco em GB"""
-              total, used, free = shutil.disk_usage("/")
-              return {
-                  'total': total / (1024**3),
-                  'used': used / (1024**3),
-                  'free': free / (1024**3)
-              }
-
-          # ==================== GMAIL API ====================
           def get_gmail_service():
-              """Carrega credenciais do Gmail"""
-              if not os.path.exists(GMAIL_TOKEN):
-                  raise FileNotFoundError(f"❌ Arquivo '{GMAIL_TOKEN}' não encontrado!")
+              """Carrega as credenciais do pickle e retorna o serviço Gmail"""
+              if not os.path.exists(TOKEN_PICKLE):
+                  raise FileNotFoundError(f"❌ Arquivo '{TOKEN_PICKLE}' não encontrado!")
               
-              with open(GMAIL_TOKEN, 'rb') as token:
+              with open(TOKEN_PICKLE, 'rb') as token:
                   creds = pickle.load(token)
               
               if creds and creds.expired and creds.refresh_token:
                   print("🔄 Renovando token do Gmail...")
                   creds.refresh(Request())
-                  with open(GMAIL_TOKEN, 'wb') as token:
+                  with open(TOKEN_PICKLE, 'wb') as token:
                       pickle.dump(creds, token)
               
               return build('gmail', 'v1', credentials=creds)
 
-          def get_chatgpt_code(service, max_attempts=60, interval=3):
-              """Aguarda e extrai o código de verificação do ChatGPT"""
-              print("   📧 Aguardando código do ChatGPT...")
+          def get_chatgpt_code(service, max_attempts=30, interval=2):
+              """Aguarda e extrai o código de verificação do ChatGPT do email."""
+              print("📧 Aguardando email com código do ChatGPT...")
               
               start_time = datetime.now(timezone.utc)
               
               for attempt in range(max_attempts):
-                  print(f"      Tentativa {attempt + 1}/{max_attempts}...", end="\r")
+                  print(f"   Tentativa {attempt + 1}/{max_attempts}...", end="\r")
                   
                   query = "from:noreply@tm.openai.com subject:Your ChatGPT code is"
                   results = service.users().messages().list(
@@ -404,517 +311,508 @@ jobs:
                       match = re.search(r'Your ChatGPT code is (\d{6})', subject)
                       if match:
                           code = match.group(1)
-                          print(f"\n   ✅ Código encontrado: {code}")
+                          print(f"\n✅ Código encontrado: {code}")
                           return code
                   
                   time.sleep(interval)
               
               raise TimeoutError("❌ Tempo esgotado aguardando o email com o código.")
 
-          # ==================== YOUTUBE API ====================
-          def get_youtube_service(pkl_path):
-              """Carrega credenciais do YouTube de um arquivo pkl"""
-              with open(pkl_path, 'rb') as f:
-                  creds = pickle.load(f)
+          def mark_email_as_read(service, subject_contains="Your ChatGPT code is"):
+              """Marca os emails de código como lidos"""
+              query = f"from:noreply@tm.openai.com subject:{subject_contains} is:unread"
+              results = service.users().messages().list(userId='me', q=query).execute()
               
-              if creds and creds.expired and creds.refresh_token:
-                  print("   🔄 Renovando token do YouTube...")
-                  creds.refresh(Request())
-                  with open(pkl_path, 'wb') as f:
-                      pickle.dump(creds, f)
-              
-              return build('youtube', 'v3', credentials=creds)
+              for msg in results.get('messages', []):
+                  service.users().messages().modify(
+                      userId='me',
+                      id=msg['id'],
+                      body={'removeLabelIds': ['UNREAD']}
+                  ).execute()
 
-          def upload_to_youtube(youtube, video_path, title, description, tags, thumbnail_path=None):
-              """Faz upload do vídeo para o YouTube como privado"""
-              body = {
-                  'snippet': {
-                      'title': title[:100],
-                      'description': description[:5000],
-                      'tags': tags[:500] if tags else [],
-                      'categoryId': '22'
-                  },
-                  'status': {
-                      'privacyStatus': 'private',
-                      'selfDeclaredMadeForKids': False
-                  }
+          def download_image_direct(url, cookies, user_agent, output_path):
+              """Baixa a imagem usando as cookies da sessão"""
+              cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+              
+              headers = {
+                  "Cookie": cookie_str,
+                  "User-Agent": user_agent,
+                  "Referer": "https://chatgpt.com/"
               }
               
-              media = MediaFileUpload(
-                  video_path,
-                  mimetype='video/mp4',
-                  resumable=True,
-                  chunksize=1024*1024*5  # 5MB chunks
-              )
+              response = requests.get(url, headers=headers, stream=True)
               
-              print(f"   📤 Iniciando upload...")
-              
-              request = youtube.videos().insert(
-                  part=','.join(body.keys()),
-                  body=body,
-                  media_body=media
-              )
-              
-              response = None
-              last_progress = 0
-              while response is None:
-                  status, response = request.next_chunk()
-                  if status:
-                      progress = int(status.progress() * 100)
-                      if progress >= last_progress + 10:
-                          print(f"   📊 Upload: {progress}%")
-                          last_progress = progress
-              
-              video_id = response['id']
-              print(f"   ✅ Upload concluído! ID: {video_id}")
-              
-              # Upload da thumbnail
-              if thumbnail_path and os.path.exists(thumbnail_path):
-                  try:
-                      print(f"   🖼️ Enviando thumbnail...")
-                      youtube.thumbnails().set(
-                          videoId=video_id,
-                          media_body=MediaFileUpload(thumbnail_path)
-                      ).execute()
-                      print(f"   ✅ Thumbnail enviada!")
-                  except Exception as e:
-                      print(f"   ⚠️ Erro ao enviar thumbnail: {e}")
-              
-              return video_id
+              if response.status_code == 200:
+                  with open(output_path, 'wb') as f:
+                      for chunk in response.iter_content(chunk_size=8192):
+                          f.write(chunk)
+                  return True
+              return False
 
-          # ==================== CHATGPT THUMBNAIL GENERATOR ====================
-          def generate_thumbnail(screenshot_path, clip_info, gmail_service, browser_context=None):
-              """Gera thumbnail usando ChatGPT"""
-              print(f"\n   🎨 Gerando thumbnail com ChatGPT...")
+          def generate_thumbnail(clip_info, browser, is_first=False):
+              """Gera thumbnail para um clipe específico"""
+              clip = clip_info['clip']
+              image_path = os.path.abspath(clip_info['thumbnail_base'])
+              output_path = clip_info['thumbnail_final']
               
-              clip_json = json.dumps(clip_info, indent=2, ensure_ascii=False)
-              prompt = f"transforme em uma thumbnail para youtube(1280x720), esse é o clipe:\n{clip_json}"
+              print(f"\n{'='*60}")
+              print(f"🎨 GERANDO THUMBNAIL {clip_info['index']}/{clip_info['total']}")
+              print(f"{'='*60}")
+              print(f"🎬 Clipe: {clip['title']}")
               
-              thumbnail_path = os.path.join(WORK_DIR, f"thumb_{clip_info['clip_id']}.png")
+              if not os.path.exists(image_path):
+                  print(f"❌ Imagem base não encontrada: {image_path}")
+                  return False
+              
+              # Criar prompt com informações do clipe
+              prompt = f"""transforme em uma thumbnail para youtube, esse é o clipe:
+          {{
+            "title": "{clip['title']}",
+            "category": "{clip['category']}",
+            "thumbnail_text": "{clip['thumbnail_text']}",
+            "reason": "{clip['reason']}"
+          }}"""
+              
+              context = browser.new_context(
+                  no_viewport=True,
+                  accept_downloads=True,
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                  locale='en-US',
+              )
+              
+              page = context.new_page()
+              page.set_default_timeout(TIMEOUT)
+              
+              try:
+                  if is_first:
+                      # Fazer login apenas na primeira vez
+                      print("🔐 Fazendo login no ChatGPT...")
+                      gmail_service = get_gmail_service()
+                      
+                      page.goto(CHATGPT_URL, wait_until='networkidle')
+                      
+                      login_button = page.locator('[data-testid="login-button"]')
+                      login_button.wait_for(state='visible')
+                      login_button.click()
+                      
+                      email_input = page.locator('input[name="email"]')
+                      email_input.wait_for(state='visible')
+                      email_input.click()
+                      time.sleep(0.3)
+                      email_input.fill(EMAIL_ADDRESS)
+                      
+                      continue_button = page.locator('button[type="submit"]:has-text("Continue")')
+                      continue_button.wait_for(state='visible')
+                      time.sleep(0.5)
+                      continue_button.click()
+                      
+                      code = get_chatgpt_code(gmail_service)
+                      
+                      code_input = page.locator('input[name="code"]')
+                      code_input.wait_for(state='visible')
+                      time.sleep(0.5)
+                      code_input.click()
+                      code_input.fill(code)
+                      
+                      validate_button = page.locator('button[name="intent"][value="validate"]')
+                      validate_button.wait_for(state='visible')
+                      time.sleep(0.3)
+                      validate_button.click()
+                      
+                      page.wait_for_url("**/", timeout=30000)
+                      time.sleep(3)
+                      
+                      print("✅ Login realizado!")
+                      mark_email_as_read(gmail_service)
+                  else:
+                      # Já está logado, apenas acessar
+                      page.goto(CHATGPT_URL, wait_until='domcontentloaded')
+                      time.sleep(2)
+                  
+                  # Criar nova imagem
+                  print("🎨 Criando imagem...")
+                  plus_btn = page.locator('[data-testid="composer-plus-btn"]')
+                  plus_btn.wait_for(state="visible", timeout=15000)
+                  plus_btn.click()
+                  time.sleep(1)
+                  
+                  create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
+                  create_image_btn.wait_for(state="visible", timeout=5000)
+                  create_image_btn.click()
+                  time.sleep(2)
+                  
+                  # Adicionar imagem base
+                  print("📤 Adicionando imagem base...")
+                  file_input = page.locator('input[type="file"]').first
+                  file_input.set_input_files(image_path)
+                  time.sleep(2)
+                  
+                  # Inserir prompt
+                  print("📝 Inserindo prompt...")
+                  textarea = page.locator('#prompt-textarea')
+                  textarea.wait_for(state="visible", timeout=5000)
+                  textarea.click()
+                  time.sleep(0.5)
+                  
+                  # Escapar aspas no prompt para JavaScript
+                  escaped_prompt = prompt.replace('"', '\\"').replace('\n', '\\n')
+                  
+                  page.evaluate(f'''
+                      () => {{
+                          const textarea = document.querySelector('#prompt-textarea');
+                          if (!textarea) return;
+                          const p = textarea.querySelector('p');
+                          if (p) {{
+                              p.textContent = `{escaped_prompt}`;
+                          }} else {{
+                              textarea.innerHTML = `<p>{escaped_prompt}</p>`;
+                          }}
+                          textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                      }}
+                  ''')
+                  time.sleep(1)
+                  
+                  # Enviar
+                  print("🚀 Gerando thumbnail...")
+                  send_btn = page.locator('#composer-submit-button')
+                  send_btn.wait_for(state="visible", timeout=5000)
+                  send_btn.click()
+                  
+                  # Aguardar geração
+                  print("⏳ Aguardando geração (4 minutos)...")
+                  time.sleep(240)
+                  
+                  # Baixar imagem
+                  print("💾 Baixando thumbnail...")
+                  image_containers = page.locator('div[class*="group/imagegen-image"]').all()
+                  
+                  if len(image_containers) > 0:
+                      last_container = image_containers[-1]
+                      last_container.hover()
+                      time.sleep(1)
+                      
+                      download_btn = last_container.locator('button[aria-label="Download this image"]')
+                      download_btn.wait_for(state="visible", timeout=5000)
+                      
+                      with page.expect_download(timeout=60000) as download_info:
+                          download_btn.click()
+                      
+                      download = download_info.value
+                      download.save_as(output_path)
+                      
+                      print(f"✅ Thumbnail salva: {output_path}")
+                      context.close()
+                      return True
+                  else:
+                      print("❌ Nenhuma imagem gerada encontrada")
+                      context.close()
+                      return False
+                  
+              except Exception as e:
+                  print(f"❌ Erro ao gerar thumbnail: {e}")
+                  context.close()
+                  return False
+
+          def main():
+              print("🎨 GERADOR DE THUMBNAILS PARA YOUTUBE")
+              print("="*60)
+              
+              # Carregar informações dos clipes
+              with open(CLIPS_INFO_FILE, 'r', encoding='utf-8') as f:
+                  clips_info = json.load(f)
+              
+              if not clips_info:
+                  print("⚠️ Nenhum clipe para processar")
+                  return
+              
+              print(f"📊 {len(clips_info)} thumbnails para gerar")
               
               with sync_playwright() as p:
                   browser = p.chromium.launch(
                       headless=HEADLESS,
                       args=[
+                          '--start-maximized',
                           '--disable-blink-features=AutomationControlled',
                           '--no-sandbox',
                           '--disable-dev-shm-usage',
-                          '--disable-gpu',
                       ]
                   )
                   
-                  context = browser.new_context(
-                      viewport={'width': 1920, 'height': 1080},
-                      accept_downloads=True,
-                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                      locale='en-US',
-                  )
+                  success_count = 0
                   
-                  page = context.new_page()
-                  page.set_default_timeout(TIMEOUT)
-                  
-                  try:
-                      # Acessa ChatGPT
-                      print("      🔗 Acessando ChatGPT...")
-                      page.goto(CHATGPT_URL, wait_until='networkidle', timeout=60000)
-                      time.sleep(3)
+                  for idx, clip_info in enumerate(clips_info):
+                      is_first = (idx == 0)
                       
-                      # Verifica login
-                      login_needed = False
-                      try:
-                          login_button = page.locator('[data-testid="login-button"]')
-                          if login_button.is_visible(timeout=5000):
-                              login_needed = True
-                      except:
-                          pass
-                      
-                      if login_needed:
-                          print("      🔐 Fazendo login...")
-                          login_button = page.locator('[data-testid="login-button"]')
-                          login_button.click()
-                          
-                          email_input = page.locator('input[name="email"]')
-                          email_input.wait_for(state='visible', timeout=15000)
-                          email_input.fill(EMAIL_ADDRESS)
-                          
-                          continue_button = page.locator('button[type="submit"]:has-text("Continue")')
-                          continue_button.click()
-                          
-                          code = get_chatgpt_code(gmail_service)
-                          
-                          code_input = page.locator('input[name="code"]')
-                          code_input.wait_for(state='visible', timeout=15000)
-                          code_input.fill(code)
-                          
-                          validate_button = page.locator('button[name="intent"][value="validate"]')
-                          validate_button.click()
-                          
-                          page.wait_for_url("**/", timeout=30000)
-                          time.sleep(5)
-                          print("      ✅ Login realizado!")
-                      
-                      # Criar imagem
-                      print("      📌 Selecionando 'Create image'...")
-                      page.goto(CHATGPT_URL, wait_until='domcontentloaded')
-                      time.sleep(3)
-                      
-                      plus_btn = page.locator('[data-testid="composer-plus-btn"]')
-                      plus_btn.wait_for(state="visible", timeout=15000)
-                      plus_btn.click()
-                      time.sleep(1)
-                      
-                      create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
-                      create_image_btn.wait_for(state="visible", timeout=5000)
-                      create_image_btn.click()
-                      time.sleep(2)
-                      
-                      # Adicionar imagem
-                      print("      📌 Adicionando screenshot...")
-                      try:
-                          file_input = page.locator('input[type="file"]').first
-                          file_input.set_input_files(screenshot_path)
-                          print("      ✅ Imagem adicionada!")
-                          time.sleep(2)
-                      except Exception as e:
-                          print(f"      ⚠️ Método alternativo: {e}")
-                          with open(screenshot_path, 'rb') as f:
-                              file_content = base64.b64encode(f.read()).decode()
-                          
-                          file_name = os.path.basename(screenshot_path)
-                          page.evaluate(f'''
-                              () => {{
-                                  const base64 = "{file_content}";
-                                  const binaryString = atob(base64);
-                                  const bytes = new Uint8Array(binaryString.length);
-                                  for (let i = 0; i < binaryString.length; i++) {{
-                                      bytes[i] = binaryString.charCodeAt(i);
-                                  }}
-                                  const blob = new Blob([bytes], {{ type: 'image/png' }});
-                                  const file = new File([blob], '{file_name}', {{ type: 'image/png' }});
-                                  
-                                  const target = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-                                  if (!target) return false;
-                                  
-                                  const dataTransfer = new DataTransfer();
-                                  dataTransfer.items.add(file);
-                                  
-                                  ['dragenter', 'dragover', 'drop'].forEach(eventType => {{
-                                      const event = new DragEvent(eventType, {{
-                                          bubbles: true,
-                                          cancelable: true,
-                                          dataTransfer: dataTransfer
-                                      }});
-                                      target.dispatchEvent(event);
-                                  }});
-                                  
-                                  return true;
-                              }}
-                          ''')
-                          time.sleep(3)
-                      
-                      # Inserir prompt
-                      print("      📌 Inserindo prompt...")
-                      prompt_escaped = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace("'", "\\'")
-                      
-                      textarea = page.locator('#prompt-textarea')
-                      textarea.wait_for(state="visible", timeout=5000)
-                      textarea.click()
-                      time.sleep(0.5)
-                      
-                      page.evaluate(f'''
-                          () => {{
-                              const textarea = document.querySelector('#prompt-textarea');
-                              if (!textarea) return;
-                              
-                              const p = textarea.querySelector('p');
-                              if (p) {{
-                                  p.innerHTML = "{prompt_escaped}";
-                              }} else {{
-                                  textarea.innerHTML = "<p>{prompt_escaped}</p>";
-                              }}
-                              
-                              textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                          }}
-                      ''')
-                      time.sleep(1)
-                      
-                      # Enviar
-                      print("      📌 Enviando...")
-                      send_btn = page.locator('#composer-submit-button')
-                      send_btn.wait_for(state="visible", timeout=5000)
-                      send_btn.click()
-                      
-                      # Aguardar geração (4 minutos)
-                      print("      ⏳ Aguardando geração (4 min)...")
-                      for remaining in range(240, 0, -30):
-                          print(f"         Restam {remaining}s...", end='\r')
-                          time.sleep(30)
-                      print("      ✅ Tempo de espera concluído!")
-                      
-                      # Baixar imagem
-                      print("      📌 Baixando thumbnail...")
-                      time.sleep(5)
-                      
-                      try:
-                          image_containers = page.locator('div[class*="group/imagegen-image"]').all()
-                          
-                          if len(image_containers) > 0:
-                              last_container = image_containers[-1]
-                              last_container.hover()
-                              time.sleep(1)
-                              
-                              download_btn = last_container.locator('button[aria-label="Download this image"]')
-                              download_btn.wait_for(state="visible", timeout=10000)
-                              
-                              with page.expect_download(timeout=60000) as download_info:
-                                  download_btn.click()
-                              
-                              download = download_info.value
-                              download.save_as(thumbnail_path)
-                              print(f"      ✅ Thumbnail salva!")
-                          else:
-                              # Tenta URL direta
-                              img_url = page.evaluate('''
-                                  () => {
-                                      const containers = document.querySelectorAll('div[class*="group/imagegen-image"]');
-                                      if (containers.length > 0) {
-                                          const lastContainer = containers[containers.length - 1];
-                                          const img = lastContainer.querySelector('img[alt="Generated image"]');
-                                          return img ? img.src : null;
-                                      }
-                                      return null;
-                                  }
-                              ''')
-                              
-                              if img_url:
-                                  cookies = context.cookies()
-                                  cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-                                  
-                                  headers = {
-                                      "Cookie": cookie_str,
-                                      "User-Agent": page.evaluate("navigator.userAgent"),
-                                      "Referer": "https://chatgpt.com/"
-                                  }
-                                  
-                                  response = requests.get(img_url, headers=headers)
-                                  if response.status_code == 200:
-                                      with open(thumbnail_path, 'wb') as f:
-                                          f.write(response.content)
-                                      print(f"      ✅ Thumbnail baixada via URL!")
-                                  else:
-                                      thumbnail_path = None
-                              else:
-                                  thumbnail_path = None
-                                  
-                      except Exception as e:
-                          print(f"      ❌ Erro: {e}")
-                          thumbnail_path = None
-                      
-                  except Exception as e:
-                      print(f"      ❌ Erro na geração: {e}")
-                      try:
-                          page.screenshot(path=f'error_{clip_info["clip_id"]}.png')
-                      except:
-                          pass
-                      thumbnail_path = None
-                  
-                  finally:
-                      browser.close()
-              
-              return thumbnail_path if thumbnail_path and os.path.exists(thumbnail_path) else None
-
-          # ==================== MAIN ====================
-          def main():
-              print("=" * 70)
-              print("   YOUTUBE CLIPPER - DOWNLOAD OTIMIZADO POR SEGMENTO")
-              print("=" * 70)
-              
-              disk = get_disk_usage()
-              print(f"\n💾 Disco: {disk['free']:.1f} GB livres de {disk['total']:.1f} GB")
-              
-              # Carregar análise
-              print("\n📄 Carregando analise_resultado.json...")
-              with open('analise_resultado.json', 'r', encoding='utf-8') as f:
-                  analise = json.load(f)
-              
-              # Filtrar apenas clipes do YouTube
-              youtube_clips = [c for c in analise.get('clips', []) if c.get('platform') == 'youtube']
-              print(f"   📹 {len(youtube_clips)} clipes do YouTube encontrados")
-              
-              if not youtube_clips:
-                  print("❌ Nenhum clipe do YouTube encontrado!")
-                  return
-              
-              # Carregar credenciais do YouTube
-              print("\n🔑 Carregando credenciais...")
-              youtube_credentials = []
-              
-              for file in os.listdir('analisar'):
-                  if file.endswith('.json'):
-                      filepath = os.path.join('analisar', file)
-                      try:
-                          with open(filepath, 'r', encoding='utf-8') as f:
-                              cred_data = json.load(f)
-                              if 'pkl_file' in cred_data:
-                                  youtube_credentials.append(cred_data)
-                      except:
-                          continue
-              
-              print(f"   🔐 {len(youtube_credentials)} credenciais encontradas")
-              
-              if not youtube_credentials:
-                  print("❌ Nenhuma credencial do YouTube encontrada!")
-                  return
-              
-              # Inicializar serviços
-              print("\n📧 Conectando ao Gmail...")
-              try:
-                  gmail_service = get_gmail_service()
-                  print("   ✅ Gmail conectado!")
-              except Exception as e:
-                  print(f"   ⚠️ Gmail não disponível: {e}")
-                  gmail_service = None
-              
-              # Usar primeira credencial
-              cred = youtube_credentials[0]
-              pkl_path = os.path.join('analisar', cred['pkl_file'])
-              
-              print(f"\n🎬 Conectando ao YouTube: {cred['channel_info']['title']}...")
-              youtube_service = get_youtube_service(pkl_path)
-              print("   ✅ YouTube conectado!")
-              
-              # Processar cada clipe
-              print("\n" + "=" * 70)
-              print("   PROCESSANDO CLIPES (UM DE CADA VEZ)")
-              print("=" * 70)
-              
-              successful = 0
-              failed = 0
-              
-              for i, clip in enumerate(youtube_clips, 1):
-                  print(f"\n{'═' * 70}")
-                  print(f"📹 CLIPE {i}/{len(youtube_clips)}")
-                  print(f"   📝 Título: {clip['title']}")
-                  print(f"   ⏱️  Tempo: {clip['start_time']} -> {clip['end_time']}")
-                  print(f"   ⏱️  Duração: {clip['duration_seconds']}s")
-                  print(f"{'═' * 70}")
-                  
-                  # Verificar espaço em disco
-                  disk = get_disk_usage()
-                  print(f"\n   💾 Espaço livre: {disk['free']:.1f} GB")
-                  
-                  if disk['free'] < 1:
-                      print("   ⚠️ Espaço em disco baixo! Limpando...")
-                      # Limpa pasta de trabalho
-                      for f in os.listdir(WORK_DIR):
-                          os.remove(os.path.join(WORK_DIR, f))
-                  
-                  # Paths dos arquivos
-                  raw_clip_path = os.path.join(WORK_DIR, f"raw_{clip['clip_id']}.mp4")
-                  final_clip_path = os.path.join(WORK_DIR, f"final_{clip['clip_id']}.mp4")
-                  screenshot_path = os.path.join(WORK_DIR, f"screenshot_{clip['clip_id']}.png")
-                  thumbnail_path = os.path.join(WORK_DIR, f"thumb_{clip['clip_id']}.png")
-                  
-                  try:
-                      # ETAPA 1: Baixar segmento do VOD
-                      print("\n   📥 ETAPA 1: Baixando segmento do VOD...")
-                      
-                      if not download_clip_segment(VOD_URL, clip['start_time'], clip['end_time'], raw_clip_path):
-                          print("   ❌ Falha ao baixar segmento!")
-                          failed += 1
-                          cleanup_files(raw_clip_path)
-                          continue
-                      
-                      # ETAPA 2: Cortar para tempo exato
-                      print("\n   ✂️ ETAPA 2: Cortando para tempo exato...")
-                      if not trim_clip(raw_clip_path, final_clip_path, clip['start_time'], clip['end_time']):
-                          print("   ⚠️ Usando clipe sem corte")
-                          final_clip_path = raw_clip_path
-                      
-                      # ETAPA 3: Extrair screenshot
-                      print("\n   📸 ETAPA 3: Extraindo screenshot...")
-                      thumbnail_timestamp = clip.get('thumbnail_timestamp', clip['start_time'])
-                      
-                      if not extract_screenshot(raw_clip_path, thumbnail_timestamp, clip['start_time'], screenshot_path):
-                          print("   ⚠️ Continuando sem screenshot")
-                          screenshot_path = None
-                      
-                      # ETAPA 4: Gerar thumbnail (opcional)
-                      generated_thumb = None
-                      if screenshot_path and gmail_service:
-                          print("\n   🎨 ETAPA 4: Gerando thumbnail...")
-                          try:
-                              generated_thumb = generate_thumbnail(screenshot_path, clip, gmail_service)
-                          except Exception as e:
-                              print(f"   ⚠️ Erro na thumbnail: {e}")
+                      if generate_thumbnail(clip_info, browser, is_first):
+                          success_count += 1
                       else:
-                          print("\n   ⏭️ ETAPA 4: Pulando geração de thumbnail")
+                          print(f"⚠️ Falha ao gerar thumbnail para {clip_info['clip']['clip_id']}")
                       
-                      # ETAPA 5: Upload para YouTube
-                      print("\n   📤 ETAPA 5: Upload para YouTube...")
-                      
-                      video_id = upload_to_youtube(
-                          youtube_service,
-                          final_clip_path,
-                          clip['title'],
-                          clip.get('recommended_description', ''),
-                          clip.get('tags', []),
-                          generated_thumb
-                      )
-                      
-                      print(f"\n   🎉 SUCESSO! https://youtube.com/watch?v={video_id}")
-                      successful += 1
-                      
-                  except Exception as e:
-                      print(f"\n   ❌ ERRO: {e}")
-                      import traceback
-                      traceback.print_exc()
-                      failed += 1
+                      # Pequena pausa entre gerações
+                      if idx < len(clips_info) - 1:
+                          print("\n⏸️  Pausa de 10 segundos...\n")
+                          time.sleep(10)
                   
-                  finally:
-                      # ETAPA 6: Limpeza
-                      print("\n   🗑️ ETAPA 6: Limpando arquivos temporários...")
-                      cleanup_files(raw_clip_path, final_clip_path, screenshot_path, thumbnail_path)
-                      
-                      # Verifica espaço após limpeza
-                      disk = get_disk_usage()
-                      print(f"   💾 Espaço após limpeza: {disk['free']:.1f} GB")
-                  
-                  # Pausa entre clipes
-                  if i < len(youtube_clips):
-                      print("\n   ⏳ Aguardando 5 segundos antes do próximo...")
-                      time.sleep(5)
+                  browser.close()
               
-              # Resumo final
-              print("\n" + "=" * 70)
-              print("   📊 RESUMO FINAL")
-              print("=" * 70)
-              print(f"   ✅ Clipes postados com sucesso: {successful}")
-              print(f"   ❌ Clipes com falha: {failed}")
-              print(f"   📹 Total processado: {successful + failed}/{len(youtube_clips)}")
-              
-              disk = get_disk_usage()
-              print(f"\n   💾 Espaço final: {disk['free']:.1f} GB livres")
-              print("=" * 70)
+              print(f"\n✅ {success_count}/{len(clips_info)} thumbnails geradas com sucesso!")
 
           if __name__ == "__main__":
-              try:
-                  main()
-              except KeyboardInterrupt:
-                  print("\n⚠️ Operação cancelada!")
-              except Exception as e:
-                  print(f"\n❌ Erro fatal: {e}")
-                  import traceback
-                  traceback.print_exc()
-                  sys.exit(1)
-          PYTHON_SCRIPT
+              main()
+          PYTHON_SCRIPT_EOF
 
-      - name: 📊 Exibir resultados
+          cat > upload_to_youtube.py << 'PYTHON_SCRIPT_EOF'
+          import os
+          import json
+          import pickle
+          import random
+          from pathlib import Path
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          from google.auth.transport.requests import Request
+
+          CLIPS_INFO_FILE = "clips_to_upload.json"
+          YOUTUBE_ACCOUNTS_DIR = "youtube_accounts"
+
+          def load_youtube_credentials():
+              """Carrega credenciais de uma conta YouTube aleatória"""
+              accounts_dir = Path(YOUTUBE_ACCOUNTS_DIR)
+              json_files = list(accounts_dir.glob("*.json"))
+              
+              if not json_files:
+                  raise FileNotFoundError("❌ Nenhuma conta YouTube encontrada!")
+              
+              # Escolher arquivo aleatório
+              selected_file = random.choice(json_files)
+              
+              print(f"📺 Usando conta: {selected_file.name}")
+              
+              with open(selected_file, 'r') as f:
+                  account_data = json.load(f)
+              
+              # Procurar arquivo PKL correspondente
+              pkl_file = account_data.get('pkl_file')
+              if not pkl_file:
+                  raise ValueError("❌ pkl_file não encontrado no JSON")
+              
+              pkl_path = accounts_dir / pkl_file
+              
+              if not pkl_path.exists():
+                  raise FileNotFoundError(f"❌ Arquivo PKL não encontrado: {pkl_path}")
+              
+              # Carregar credenciais do pickle
+              with open(pkl_path, 'rb') as token:
+                  creds = pickle.load(token)
+              
+              # Renovar se necessário
+              if creds and creds.expired and creds.refresh_token:
+                  print("🔄 Renovando token do YouTube...")
+                  creds.refresh(Request())
+                  with open(pkl_path, 'wb') as token:
+                      pickle.dump(creds, token)
+              
+              return creds, account_data['channel_info']
+
+          def upload_video(youtube, video_file, clip_data, thumbnail_file):
+              """Faz upload de um vídeo para o YouTube"""
+              
+              clip = clip_data['clip']
+              
+              # Preparar metadados
+              title = clip['title'][:100]  # YouTube limita a 100 caracteres
+              description = clip.get('recommended_description', '')
+              tags = clip.get('tags', [])[:500]  # YouTube limita tags
+              
+              body = {
+                  'snippet': {
+                      'title': title,
+                      'description': description,
+                      'tags': tags,
+                      'categoryId': '20'  # Gaming category
+                  },
+                  'status': {
+                      'privacyStatus': 'private',  # Sempre privado
+                      'selfDeclaredMadeForKids': False,
+                  }
+              }
+              
+              # Upload do vídeo
+              print(f"📤 Fazendo upload: {title}")
+              
+              media = MediaFileUpload(
+                  video_file,
+                  chunksize=10*1024*1024,  # 10MB chunks
+                  resumable=True,
+                  mimetype='video/mp4'
+              )
+              
+              request = youtube.videos().insert(
+                  part='snippet,status',
+                  body=body,
+                  media_body=media
+              )
+              
+              response = None
+              retry_count = 0
+              max_retries = 3
+              
+              while response is None and retry_count < max_retries:
+                  try:
+                      print(f"   📊 Upload em progresso...")
+                      status, response = request.next_chunk()
+                      
+                      if status:
+                          progress = int(status.progress() * 100)
+                          print(f"   📊 Progresso: {progress}%", end='\r')
+                  
+                  except Exception as e:
+                      print(f"   ⚠️ Erro no upload (tentativa {retry_count + 1}/{max_retries}): {e}")
+                      retry_count += 1
+                      if retry_count >= max_retries:
+                          raise
+              
+              if not response:
+                  raise Exception("❌ Upload falhou após múltiplas tentativas")
+              
+              video_id = response['id']
+              print(f"\n✅ Vídeo enviado! ID: {video_id}")
+              
+              # Upload da thumbnail
+              if thumbnail_file and Path(thumbnail_file).exists():
+                  try:
+                      print(f"🖼️  Fazendo upload da thumbnail...")
+                      youtube.thumbnails().set(
+                          videoId=video_id,
+                          media_body=MediaFileUpload(thumbnail_file)
+                      ).execute()
+                      print(f"✅ Thumbnail definida!")
+                  except Exception as e:
+                      print(f"⚠️ Erro ao definir thumbnail: {e}")
+              
+              return video_id
+
+          def main():
+              print("📺 UPLOAD PARA YOUTUBE")
+              print("="*60)
+              
+              # Carregar informações dos clipes
+              with open(CLIPS_INFO_FILE, 'r', encoding='utf-8') as f:
+                  clips_info = json.load(f)
+              
+              if not clips_info:
+                  print("⚠️ Nenhum clipe para fazer upload")
+                  return
+              
+              print(f"📊 {len(clips_info)} vídeos para upload")
+              
+              # Carregar credenciais
+              creds, channel_info = load_youtube_credentials()
+              youtube = build('youtube', 'v3', credentials=creds)
+              
+              print(f"✅ Autenticado no canal: {channel_info['title']}")
+              print(f"📊 Inscritos: {channel_info['subscribers']}")
+              
+              uploaded_videos = []
+              
+              for idx, clip_info in enumerate(clips_info, 1):
+                  print(f"\n{'='*60}")
+                  print(f"📤 UPLOAD {idx}/{len(clips_info)}")
+                  print(f"{'='*60}")
+                  
+                  video_file = clip_info['video_file']
+                  thumbnail_file = clip_info.get('thumbnail_final')
+                  
+                  # Verificar se arquivo existe
+                  if not Path(video_file).exists():
+                      print(f"⚠️ Arquivo não encontrado: {video_file}")
+                      continue
+                  
+                  try:
+                      video_id = upload_video(youtube, video_file, clip_info, thumbnail_file)
+                      
+                      uploaded_videos.append({
+                          'clip_id': clip_info['clip']['clip_id'],
+                          'video_id': video_id,
+                          'title': clip_info['clip']['title'],
+                          'url': f"https://youtube.com/watch?v={video_id}"
+                      })
+                      
+                      # Limpar arquivos após upload
+                      print("🗑️  Limpando arquivos temporários...")
+                      try:
+                          Path(video_file).unlink()
+                          if thumbnail_file and Path(thumbnail_file).exists():
+                              Path(thumbnail_file).unlink()
+                          base_thumb = clip_info.get('thumbnail_base')
+                          if base_thumb and Path(base_thumb).exists():
+                              Path(base_thumb).unlink()
+                          print("✅ Arquivos removidos")
+                      except Exception as e:
+                          print(f"⚠️ Erro ao limpar: {e}")
+                      
+                  except Exception as e:
+                      print(f"❌ Erro no upload: {e}")
+                      continue
+              
+              # Salvar relatório
+              with open('upload_report.json', 'w', encoding='utf-8') as f:
+                  json.dump(uploaded_videos, f, indent=2, ensure_ascii=False)
+              
+              print(f"\n{'='*60}")
+              print(f"✅ PROCESSO CONCLUÍDO!")
+              print(f"{'='*60}")
+              print(f"📊 {len(uploaded_videos)}/{len(clips_info)} vídeos enviados")
+              print(f"📄 Relatório salvo em: upload_report.json")
+              
+              for video in uploaded_videos:
+                  print(f"\n🎬 {video['title']}")
+                  print(f"   🔗 {video['url']}")
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT_EOF
+
+          echo "✅ Scripts criados com sucesso!"
+
+      - name: 🎬 Processar e Baixar Clipes
+        run: |
+          python process_clips.py
+
+      - name: 🎨 Gerar Thumbnails
+        run: |
+          python generate_thumbnails.py
+
+      - name: 📺 Upload para YouTube
+        run: |
+          python upload_to_youtube.py
+
+      - name: 📊 Exibir Relatório Final
         if: always()
         run: |
-          echo "=== Status do disco ==="
-          df -h
-          echo ""
-          echo "=== Arquivos temporários ==="
-          ls -la temp_work/ 2>/dev/null || echo "Pasta vazia ou removida"
-          echo "=== Fim ==="
+          if [ -f upload_report.json ]; then
+            echo "📊 RELATÓRIO DE UPLOADS"
+            echo "======================="
+            cat upload_report.json
+          else
+            echo "⚠️ Nenhum upload realizado"
+          fi
+
+      - name: 📤 Upload do Relatório
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-report
+          path: |
+            upload_report.json
+            clips_to_upload.json
+          retention-days: 30
+
+      - name: 🧹 Limpeza Final
+        if: always()
+        run: |
+          echo "🧹 Limpando arquivos temporários..."
+          rm -rf temp_processing
+          rm -rf config_data
+          rm -rf youtube_accounts
+          echo "✅ Limpeza concluída!"
