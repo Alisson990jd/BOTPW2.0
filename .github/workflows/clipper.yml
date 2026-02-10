@@ -54,8 +54,6 @@ jobs:
           google-auth-httplib2
           requests
           yt-dlp
-          Pillow
-          playwright
           EOF
           echo "✅ requirements.txt criado!"
 
@@ -67,15 +65,13 @@ jobs:
       - name: 📦 Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 xvfb
+          sudo apt-get install -y ffmpeg aria2
           aria2c --version | head -1
           
       - name: 📦 Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install chromium
-          python -m playwright install-deps chromium
 
       - name: 📥 Baixar configurações do repositório externo
         env:
@@ -125,346 +121,18 @@ jobs:
           echo "✅ Configurações baixadas!"
           ls -la analisar/
           
-          echo "📥 Baixando emails.txt..."
-          curl -sf -H "Authorization: token $GH_PAT" \
-               -H "Accept: application/vnd.github.v3.raw" \
-               -o chatgpt_emails.txt \
-               "https://api.github.com/repos/Alisson990jd/apiss/contents/emails.txt" || echo "⚠️ emails.txt não encontrado"
-          
-          echo "📥 Baixando thumbnail_usage.json..."
-          curl -sf -H "Authorization: token $GH_PAT" \
-               -H "Accept: application/vnd.github.v3.raw" \
-               -o thumbnail_usage.json \
-               "https://api.github.com/repos/Alisson990jd/apiss/contents/thumbnail_usage.json" || echo '{}' > thumbnail_usage.json
-          
-          echo "📧 Emails disponíveis:"
-          cat chatgpt_emails.txt 2>/dev/null || echo "Nenhum"
-          echo "📊 Uso atual:"
-          cat thumbnail_usage.json
+          echo "✅ Todos os arquivos baixados!"
 
       - name: 📂 Criar diretórios
         run: |
-          mkdir -p scripts temp_clips thumbnails
-
-      - name: 📝 Criar script ChatGPT Thumbnail
-        run: |
-          cat > scripts/chatgpt_thumbnail.py << 'CHATGPT_EOF'
-          #!/usr/bin/env python3
-          """
-          🎨 ChatGPT Thumbnail Generator
-          Gera thumbnails via ChatGPT usando Playwright
-          """
-          import os
-          import sys
-          import re
-          import time
-          import json
-          import pickle
-          import base64
-          import argparse
-          import logging
-          import requests
-          from datetime import datetime, timezone
-          from pathlib import Path
-
-          from google.auth.transport.requests import Request
-          from googleapiclient.discovery import build
-          from playwright.sync_api import sync_playwright
-
-          logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-          logger = logging.getLogger(__name__)
-
-          TOKEN_PICKLE = "gmail_token.pkl"
-          CHATGPT_URL = "https://chatgpt.com/"
-
-
-          def get_gmail_service():
-              if not os.path.exists(TOKEN_PICKLE):
-                  raise FileNotFoundError(f"'{TOKEN_PICKLE}' não encontrado!")
-              with open(TOKEN_PICKLE, 'rb') as token:
-                  creds = pickle.load(token)
-              if creds and creds.expired and creds.refresh_token:
-                  logger.info("🔄 Renovando token do Gmail...")
-                  creds.refresh(Request())
-                  with open(TOKEN_PICKLE, 'wb') as token:
-                      pickle.dump(creds, token)
-              return build('gmail', 'v1', credentials=creds)
-
-
-          def get_chatgpt_code(service, max_attempts=30, interval=2):
-              logger.info("📧 Aguardando email com código do ChatGPT...")
-              start_time = datetime.now(timezone.utc)
-              for attempt in range(max_attempts):
-                  query = "from:noreply@tm.openai.com subject:Your ChatGPT code is"
-                  results = service.users().messages().list(userId='me', q=query, maxResults=5).execute()
-                  for msg in results.get('messages', []):
-                      message = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
-                      internal_date = int(message.get('internalDate', 0)) / 1000
-                      email_time = datetime.fromtimestamp(internal_date, tz=timezone.utc)
-                      if email_time < start_time:
-                          continue
-                      headers = message['payload'].get('headers', [])
-                      subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), '')
-                      match = re.search(r'Your ChatGPT code is (\d{6})', subject)
-                      if match:
-                          code = match.group(1)
-                          logger.info(f"✅ Código encontrado: {code}")
-                          return code
-                  time.sleep(interval)
-              raise TimeoutError("❌ Tempo esgotado aguardando código.")
-
-
-          def mark_email_as_read(service):
-              query = "from:noreply@tm.openai.com subject:Your ChatGPT code is is:unread"
-              results = service.users().messages().list(userId='me', q=query).execute()
-              for msg in results.get('messages', []):
-                  service.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
-
-
-          def download_image_direct(url, cookies, user_agent, output_path):
-              cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-              headers = {"Cookie": cookie_str, "User-Agent": user_agent, "Referer": "https://chatgpt.com/"}
-              response = requests.get(url, headers=headers, stream=True)
-              if response.status_code == 200:
-                  with open(output_path, 'wb') as f:
-                      for chunk in response.iter_content(chunk_size=8192):
-                          f.write(chunk)
-                  return True
-              return False
-
-
-          def generate_thumbnail(image_path, output_path, clip_json_str, email_address):
-              logger.info(f"🎨 Iniciando geração de thumbnail via ChatGPT com {email_address}...")
-              image_path = os.path.abspath(image_path)
-              if not os.path.exists(image_path):
-                  logger.error(f"❌ Imagem não encontrada: {image_path}")
-                  return False
-
-              prompt = f"transforme em uma thumbnail para youtube(1280x720), esse é o clipe:\n{clip_json_str}"
-
-              gmail_service = get_gmail_service()
-              logger.info("✅ Gmail conectado!")
-
-              with sync_playwright() as p:
-                  browser = p.chromium.launch(
-                      headless=False,
-                      args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
-                  )
-                  context = browser.new_context(
-                      accept_downloads=True,
-                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                      locale='en-US',
-                      viewport={'width': 1280, 'height': 720}
-                  )
-                  page = context.new_page()
-                  page.set_default_timeout(60000)
-
-                  try:
-                      # LOGIN
-                      logger.info("🔗 Acessando ChatGPT...")
-                      page.goto(CHATGPT_URL, wait_until='networkidle')
-                      login_button = page.locator('[data-testid="login-button"]')
-                      login_button.wait_for(state='visible')
-                      login_button.click()
-
-                      email_input = page.locator('input[name="email"]')
-                      email_input.wait_for(state='visible')
-                      time.sleep(0.3)
-                      email_input.fill(email_address)
-
-                      continue_button = page.locator('button[type="submit"]:has-text("Continue")')
-                      continue_button.wait_for(state='visible')
-                      time.sleep(0.5)
-                      continue_button.click()
-
-                      code = get_chatgpt_code(gmail_service)
-
-                      code_input = page.locator('input[name="code"]')
-                      code_input.wait_for(state='visible')
-                      time.sleep(0.5)
-                      code_input.fill(code)
-
-                      validate_button = page.locator('button[name="intent"][value="validate"]')
-                      validate_button.wait_for(state='visible')
-                      time.sleep(0.3)
-                      validate_button.click()
-
-                      page.wait_for_url("**/", timeout=30000)
-                      time.sleep(3)
-                      logger.info("🎉 LOGIN OK!")
-
-                      try:
-                          mark_email_as_read(gmail_service)
-                      except:
-                          pass
-
-                      # CREATE IMAGE MODE
-                      page.goto(CHATGPT_URL, wait_until='domcontentloaded')
-                      time.sleep(3)
-
-                      plus_btn = page.locator('[data-testid="composer-plus-btn"]')
-                      plus_btn.wait_for(state="visible", timeout=15000)
-                      plus_btn.click()
-                      time.sleep(1)
-
-                      create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
-                      create_image_btn.wait_for(state="visible", timeout=5000)
-                      create_image_btn.click(force=True)
-                      time.sleep(2)
-
-                      # ADD IMAGE
-                      image_added = False
-                      try:
-                          plus_btn = page.locator('[data-testid="composer-plus-btn"]')
-                          plus_btn.wait_for(state="visible", timeout=5000)
-                          plus_btn.click()
-                          time.sleep(1)
-                          for selector in ['div[role="menuitemradio"]:has-text("Add photos")', 'div[role="menuitemradio"]:has-text("Upload")']:
-                              try:
-                                  btn = page.locator(selector).first
-                                  if btn.is_visible(timeout=1000):
-                                      with page.expect_file_chooser() as fc_info:
-                                          btn.click()
-                                      fc_info.value.set_files(image_path)
-                                      image_added = True
-                                      time.sleep(2)
-                                      break
-                              except:
-                                  continue
-                      except Exception as e:
-                          logger.warning(f"Método 1 falhou: {e}")
-
-                      if not image_added:
-                          try:
-                              file_input = page.locator('input[type="file"]').first
-                              file_input.set_input_files(image_path)
-                              image_added = True
-                              time.sleep(2)
-                          except Exception as e:
-                              logger.warning(f"Método 2 falhou: {e}")
-
-                      if not image_added:
-                          try:
-                              with open(image_path, 'rb') as f:
-                                  file_content = base64.b64encode(f.read()).decode()
-                              file_name = os.path.basename(image_path)
-                              page.evaluate(f'''() => {{
-                                  const base64 = "{file_content}";
-                                  const binaryString = atob(base64);
-                                  const bytes = new Uint8Array(binaryString.length);
-                                  for (let i = 0; i < binaryString.length; i++) {{ bytes[i] = binaryString.charCodeAt(i); }}
-                                  const blob = new Blob([bytes], {{ type: "image/png" }});
-                                  const file = new File([blob], "{file_name}", {{ type: "image/png" }});
-                                  const target = document.querySelector("#prompt-textarea") || document.querySelector("[contenteditable]");
-                                  if (!target) return false;
-                                  const dt = new DataTransfer();
-                                  dt.items.add(file);
-                                  ["dragenter","dragover","drop"].forEach(t => {{
-                                      target.dispatchEvent(new DragEvent(t, {{ bubbles:true, cancelable:true, dataTransfer:dt }}));
-                                  }});
-                                  return true;
-                              }}''')
-                              image_added = True
-                              time.sleep(3)
-                          except Exception as e:
-                              logger.warning(f"Método 3 falhou: {e}")
-
-                      if not image_added:
-                          logger.error("❌ Não foi possível adicionar a imagem")
-                          return False
-
-                      # SEND PROMPT
-                      time.sleep(1)
-                      textarea = page.locator('#prompt-textarea')
-                      textarea.wait_for(state="visible", timeout=5000)
-                      textarea.click()
-                      time.sleep(0.5)
-
-                      safe_prompt = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-                      page.evaluate(f'''() => {{
-                          const textarea = document.querySelector("#prompt-textarea");
-                          if (!textarea) return;
-                          const p = textarea.querySelector("p");
-                          if (p) {{ p.innerHTML = "{safe_prompt}"; }}
-                          else {{ textarea.innerHTML = "<p>{safe_prompt}</p>"; }}
-                          textarea.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                      }}''')
-                      time.sleep(1)
-
-                      send_btn = page.locator('#composer-submit-button')
-                      send_btn.wait_for(state="visible", timeout=5000)
-                      send_btn.click()
-                      logger.info("✅ Prompt enviado! Aguardando geração (~4 min)...")
-
-                      # WAIT FOR GENERATION
-                      for remaining in range(240, 0, -10):
-                          mins, secs = divmod(remaining, 60)
-                          logger.info(f"   ⏳ Restante: {mins:02d}:{secs:02d}")
-                          time.sleep(10)
-
-                      # DOWNLOAD IMAGE
-                      time.sleep(3)
-                      image_containers = page.locator('div[class*="group/imagegen-image"]').all()
-                      logger.info(f"📷 {len(image_containers)} containers encontrados")
-
-                      if len(image_containers) > 0:
-                          last_container = image_containers[-1]
-                          last_container.hover()
-                          time.sleep(1)
-                          download_btn = last_container.locator('button[aria-label="Download this image"]')
-                          download_btn.wait_for(state="visible", timeout=5000)
-
-                          with page.expect_download(timeout=60000) as download_info:
-                              download_btn.click()
-                          download_info.value.save_as(output_path)
-                          logger.info(f"✅ Thumbnail gerada: {output_path}")
-                          return True
-                      else:
-                          # Fallback: download direto da URL
-                          img_url = page.evaluate('''() => {
-                              const c = document.querySelectorAll('div[class*="group/imagegen-image"]');
-                              if (c.length > 0) { const img = c[c.length-1].querySelector('img[alt="Generated image"]'); return img ? img.src : null; }
-                              return null;
-                          }''')
-                          if img_url:
-                              cookies = context.cookies()
-                              ua = page.evaluate("navigator.userAgent")
-                              if download_image_direct(img_url, cookies, ua, output_path):
-                                  logger.info(f"✅ Thumbnail baixada via URL: {output_path}")
-                                  return True
-                          logger.error("❌ Nenhuma imagem encontrada")
-                          return False
-
-                  except Exception as e:
-                      logger.error(f"❌ Erro: {e}")
-                      try:
-                          page.screenshot(path='chatgpt_error.png')
-                      except:
-                          pass
-                      return False
-                  finally:
-                      browser.close()
-
-
-          if __name__ == "__main__":
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--image", required=True)
-              parser.add_argument("--output", required=True)
-              parser.add_argument("--clip-json", required=True)
-              parser.add_argument("--email", required=True, help="Email da conta ChatGPT")
-              args = parser.parse_args()
-              success = generate_thumbnail(args.image, args.output, args.clip_json, args.email)
-              sys.exit(0 if success else 1)
-          CHATGPT_EOF
-
-          chmod +x scripts/chatgpt_thumbnail.py
+          mkdir -p scripts temp_clips
 
       - name: 📝 Criar script otimizado
         run: |
           cat > scripts/clip_creator.py << 'SCRIPT_EOF'
           #!/usr/bin/env python3
           """
-          🎬 YouTube Clip Creator - COM THUMBNAIL MULTI-CONTA
+          🎬 YouTube Clip Creator
           """
 
           import os
@@ -474,10 +142,9 @@ jobs:
           import pickle
           import time
           import logging
-          import base64
           import requests
           from pathlib import Path
-          from datetime import datetime, timezone, timedelta
+          from datetime import datetime, timezone
           from typing import Optional, Dict, List
 
           logging.basicConfig(
@@ -491,15 +158,7 @@ jobs:
           logger = logging.getLogger(__name__)
 
           TEMP_DIR = Path("temp_clips")
-          THUMB_DIR = Path("thumbnails")
           PROCESSING_LOG = "processing_log.json"
-          EMAILS_FILE = "chatgpt_emails.txt"
-          USAGE_FILE = "thumbnail_usage.json"
-          MAX_THUMBS_PER_ACCOUNT = 3
-          RATE_LIMIT_HOURS = 24
-          GH_PAT = os.environ.get("GH_PAT", "")
-          USAGE_REPO = "Alisson990jd/apiss"
-          USAGE_REPO_PATH = "thumbnail_usage.json"
 
 
           def time_to_seconds(time_str: str) -> int:
@@ -519,118 +178,6 @@ jobs:
               s = seconds % 60
               return f"{h:02d}:{m:02d}:{s:02d}"
 
-
-          def load_emails() -> List[str]:
-              """Carrega lista de emails do arquivo"""
-              if not os.path.exists(EMAILS_FILE):
-                  logger.error(f"❌ {EMAILS_FILE} não encontrado!")
-                  return []
-              with open(EMAILS_FILE, 'r') as f:
-                  emails = [line.strip() for line in f if line.strip() and '@' in line]
-              logger.info(f"📧 {len(emails)} emails carregados")
-              return emails
-
-
-          def load_usage() -> Dict:
-              """Carrega JSON de uso de thumbnails"""
-              if not os.path.exists(USAGE_FILE):
-                  return {}
-              try:
-                  with open(USAGE_FILE, 'r') as f:
-                      return json.load(f)
-              except (json.JSONDecodeError, Exception):
-                  return {}
-
-
-          def save_usage(usage: Dict):
-              """Salva JSON de uso localmente"""
-              with open(USAGE_FILE, 'w') as f:
-                  json.dump(usage, f, indent=2, ensure_ascii=False)
-
-
-          def sync_usage_to_github(usage: Dict) -> bool:
-              """Faz push do thumbnail_usage.json para o repo apiss via GitHub API"""
-              if not GH_PAT:
-                  logger.warning("⚠️ GH_PAT não definido, não é possível sincronizar")
-                  return False
-              
-              try:
-                  # Pegar SHA atual do arquivo (necessário para update)
-                  headers = {
-                      "Authorization": f"token {GH_PAT}",
-                      "Accept": "application/vnd.github.v3+json"
-                  }
-                  url = f"https://api.github.com/repos/{USAGE_REPO}/contents/{USAGE_REPO_PATH}"
-                  
-                  resp = requests.get(url, headers=headers)
-                  sha = None
-                  if resp.status_code == 200:
-                      sha = resp.json().get("sha")
-                  
-                  # Preparar conteúdo
-                  content_str = json.dumps(usage, indent=2, ensure_ascii=False)
-                  content_b64 = base64.b64encode(content_str.encode()).decode()
-                  
-                  body = {
-                      "message": f"update thumbnail usage - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                      "content": content_b64
-                  }
-                  if sha:
-                      body["sha"] = sha
-                  
-                  resp = requests.put(url, headers=headers, json=body)
-                  if resp.status_code in (200, 201):
-                      logger.info("   ✅ thumbnail_usage.json sincronizado com GitHub")
-                      return True
-                  else:
-                      logger.warning(f"   ⚠️ Falha ao sincronizar: {resp.status_code} - {resp.text[:200]}")
-                      return False
-              except Exception as e:
-                  logger.warning(f"   ⚠️ Erro ao sincronizar: {e}")
-                  return False
-
-
-          def get_available_email(emails: List[str], usage: Dict) -> Optional[str]:
-              """Retorna o próximo email com cota disponível (< 3 nas últimas 24h)"""
-              now = datetime.now(timezone.utc)
-              cutoff = now - timedelta(hours=RATE_LIMIT_HOURS)
-              
-              for email in emails:
-                  account = usage.get(email, {})
-                  history = account.get("history", [])
-                  
-                  # Filtrar apenas usos nas últimas 24h
-                  recent = [ts for ts in history if datetime.fromisoformat(ts) > cutoff]
-                  
-                  if len(recent) < MAX_THUMBS_PER_ACCOUNT:
-                      logger.info(f"   📧 Email disponível: {email} ({len(recent)}/{MAX_THUMBS_PER_ACCOUNT} usados)")
-                      return email
-                  else:
-                      logger.info(f"   ⏳ Email esgotado: {email} ({len(recent)}/{MAX_THUMBS_PER_ACCOUNT})")
-              
-              return None
-
-
-          def record_usage(email: str, usage: Dict) -> Dict:
-              """Registra uso bem-sucedido de uma conta"""
-              now = datetime.now(timezone.utc).isoformat()
-              cutoff = datetime.now(timezone.utc) - timedelta(hours=RATE_LIMIT_HOURS)
-              
-              if email not in usage:
-                  usage[email] = {"count": 0, "history": []}
-              
-              # Limpar histórico antigo (> 24h)
-              usage[email]["history"] = [
-                  ts for ts in usage[email].get("history", [])
-                  if datetime.fromisoformat(ts) > cutoff
-              ]
-              
-              # Adicionar novo uso
-              usage[email]["history"].append(now)
-              usage[email]["count"] = len(usage[email]["history"])
-              usage[email]["last_used"] = now
-              
-              return usage
 
 
           def load_clips_config() -> List[Dict]:
@@ -742,62 +289,9 @@ jobs:
                   return False
 
 
-          def capture_thumbnail(video_path: Path, timestamp: str, output_path: Path) -> bool:
-              """
-              Captura frame do vídeo como thumbnail
-              Garante resolução 1280x720 (requerido pelo YouTube)
-              """
-              logger.info(f"📸 Capturando thumbnail em {timestamp}...")
-              
-              # Primeiro, captura o frame
-              temp_frame = output_path.with_suffix('.temp.png')
-              
-              cmd_capture = [
-                  "ffmpeg", "-y",
-                  "-ss", timestamp,
-                  "-i", str(video_path),
-                  "-vframes", "1",
-                  "-q:v", "1",  # Máxima qualidade
-                  str(temp_frame)
-              ]
-              
-              try:
-                  result = subprocess.run(cmd_capture, capture_output=True, text=True, timeout=30)
-                  
-                  if result.returncode != 0 or not temp_frame.exists():
-                      logger.error(f"   ❌ Falha na captura: {result.stderr}")
-                      return False
-                  
-                  # Agora redimensiona para 1280x720 (requisito do YouTube)
-                  cmd_resize = [
-                      "ffmpeg", "-y",
-                      "-i", str(temp_frame),
-                      "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                      "-q:v", "1",
-                      str(output_path)
-                  ]
-                  
-                  result = subprocess.run(cmd_resize, capture_output=True, text=True, timeout=30)
-                  
-                  # Remove temp
-                  if temp_frame.exists():
-                      temp_frame.unlink()
-                  
-                  if result.returncode == 0 and output_path.exists():
-                      size_kb = output_path.stat().st_size / 1024
-                      logger.info(f"   ✅ Thumbnail capturada: {size_kb:.1f}KB (1280x720)")
-                      return True
-                  else:
-                      logger.error(f"   ❌ Falha no resize: {result.stderr}")
-                      return False
-                      
-              except Exception as e:
-                  logger.error(f"   ❌ Erro: {e}")
-                  return False
 
-
-          def upload_to_youtube(video_path: Path, thumb_path: Optional[Path], clip_data: Dict, credentials: Dict) -> Optional[str]:
-              """Upload para YouTube com thumbnail"""
+          def upload_to_youtube(video_path: Path, clip_data: Dict, credentials: Dict) -> Optional[str]:
+              """Upload para YouTube"""
               logger.info("📤 Upload para YouTube...")
               
               try:
@@ -878,46 +372,6 @@ jobs:
                   logger.info(f"   ✅ Vídeo enviado: {video_id}")
                   logger.info(f"   🔗 https://youtube.com/watch?v={video_id}")
                   
-                  # Upload da thumbnail
-                  if thumb_path and thumb_path.exists():
-                      thumb_size = thumb_path.stat().st_size
-                      logger.info(f"   🖼️ Enviando thumbnail ({thumb_size/1024:.1f}KB)...")
-                      
-                      if thumb_size < 100:
-                          logger.error(f"   ❌ Thumbnail muito pequena ({thumb_size} bytes)")
-                      else:
-                          try:
-                              thumb_mimetype = 'image/jpeg' if str(thumb_path).lower().endswith('.jpg') else 'image/png'
-                              thumb_media = MediaFileUpload(
-                                  str(thumb_path), 
-                                  mimetype=thumb_mimetype,
-                                  resumable=False
-                              )
-                              
-                              thumb_response = service.thumbnails().set(
-                                  videoId=video_id, 
-                                  media_body=thumb_media
-                              ).execute()
-                              
-                              if thumb_response:
-                                  logger.info(f"   ✅ Thumbnail definida com sucesso!")
-                                  logger.info(f"      URL: {thumb_response.get('items', [{}])[0].get('default', {}).get('url', 'N/A')}")
-                              else:
-                                  logger.warning("   ⚠️ Resposta vazia da API de thumbnail")
-                                  
-                          except HttpError as e:
-                              error_content = e.content.decode() if hasattr(e, 'content') else str(e)
-                              logger.error(f"   ❌ Erro HTTP ao definir thumbnail: {e.resp.status}")
-                              logger.error(f"      Detalhes: {error_content}")
-                              
-                              if e.resp.status == 403:
-                                  logger.error("   ⚠️ O canal pode não ter permissão para thumbnails customizadas")
-                                  logger.error("   ⚠️ Verifique se o canal está verificado no YouTube")
-                              
-                          except Exception as e:
-                              logger.error(f"   ❌ Erro ao definir thumbnail: {type(e).__name__}: {e}")
-                  else:
-                      logger.warning(f"   ⚠️ Thumbnail não encontrada: {thumb_path}")
                   
                   return video_id
                   
@@ -939,7 +393,6 @@ jobs:
               logger.info(f"🎬 [{idx+1}/{total}] {clip_id}")
               logger.info(f"   📝 {clip_data.get('title', 'N/A')[:60]}...")
               logger.info(f"   ⏱️  {clip_data.get('start_time')} → {clip_data.get('end_time')}")
-              logger.info(f"   📸 Thumbnail em: {clip_data.get('thumbnail_timestamp', 'N/A')}")
               logger.info("=" * 60)
               
               result = {
@@ -947,12 +400,10 @@ jobs:
                   "title": clip_data.get("title"), 
                   "status": "pending", 
                   "video_id": None, 
-                  "error": None,
-                  "thumbnail_status": "pending"
+                  "error": None
               }
               
               video_path = TEMP_DIR / f"{clip_id}.mp4"
-              thumb_path = THUMB_DIR / f"{clip_id}_thumb.png"
               
               try:
                   # 1. Download do clipe
@@ -966,119 +417,9 @@ jobs:
                       result["error"] = "Download falhou"
                       return result
                   
-                  # 2. Captura screenshot do VOD para usar como base
-                  thumb_ts = clip_data.get("thumbnail_timestamp", clip_data.get("start_time"))
-                  start_sec = time_to_seconds(clip_data.get("start_time", "00:00:00"))
-                  thumb_sec = time_to_seconds(thumb_ts)
-                  rel_thumb = seconds_to_time(max(0, thumb_sec - start_sec))
-                  
-                  screenshot_path = THUMB_DIR / f"{clip_id}_screenshot.png"
-                  screenshot_ok = capture_thumbnail(video_path, rel_thumb, screenshot_path)
-                  
-                  # 3. Gera thumbnail via ChatGPT (com rotação de contas)
-                  thumb_success = False
-                  if screenshot_ok and screenshot_path.exists():
-                      # Carregar emails e uso
-                      emails = load_emails()
-                      usage = load_usage()
-                      
-                      if not emails:
-                          logger.warning("   ⚠️ Nenhum email disponível, pulando thumbnail")
-                          result["thumbnail_status"] = "no_emails"
-                      else:
-                          # Tentar com email disponível
-                          email = get_available_email(emails, usage)
-                          
-                          if not email:
-                              logger.warning("   ⚠️ Todos os emails atingiram o limite de 3 thumbs/24h")
-                              result["thumbnail_status"] = "rate_limited"
-                          else:
-                              logger.info(f"   🎨 Gerando thumbnail via ChatGPT com {email}...")
-                              clip_json_str = json.dumps(clip_data, ensure_ascii=False, indent=2)
-                              try:
-                                  chatgpt_result = subprocess.run(
-                                      [
-                                          "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
-                                          sys.executable, "scripts/chatgpt_thumbnail.py",
-                                          "--image", str(screenshot_path),
-                                          "--output", str(thumb_path),
-                                          "--clip-json", clip_json_str,
-                                          "--email", email
-                                      ],
-                                      capture_output=True, text=True, timeout=600
-                                  )
-                                  if chatgpt_result.returncode == 0 and thumb_path.exists():
-                                      thumb_success = True
-                                      result["thumbnail_status"] = "chatgpt_generated"
-                                      logger.info(f"   ✅ Thumbnail gerada via ChatGPT com {email}!")
-                                      
-                                      # Registrar uso e sincronizar com GitHub
-                                      usage = record_usage(email, usage)
-                                      save_usage(usage)
-                                      sync_usage_to_github(usage)
-                                      logger.info(f"   📊 Uso atualizado: {email} -> {usage[email]['count']}/{MAX_THUMBS_PER_ACCOUNT}")
-                                  else:
-                                      logger.warning(f"   ⚠️ ChatGPT falhou com {email}, pulando thumbnail")
-                                      logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
-                                      logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
-                                      result["thumbnail_status"] = "failed"
-                              except subprocess.TimeoutExpired:
-                                  logger.warning(f"   ⚠️ ChatGPT timeout com {email}, pulando thumbnail")
-                                  result["thumbnail_status"] = "timeout"
-                              except Exception as e:
-                                  logger.warning(f"   ⚠️ ChatGPT erro com {email}: {e}, pulando thumbnail")
-                                  result["thumbnail_status"] = "error"
-                              
-                              # Limpar thumb corrompida se existir e não foi sucesso
-                              if not thumb_success:
-                                  try:
-                                      if thumb_path.exists():
-                                          thumb_path.unlink()
-                                  except:
-                                      pass
-                  else:
-                      result["thumbnail_status"] = "failed"
-                      logger.warning(f"   ⚠️ Screenshot não capturado, sem thumbnail")
-                  
-                  # Limpar screenshot temporário
-                  try:
-                      if screenshot_path.exists():
-                          screenshot_path.unlink()
-                  except:
-                      pass
-                  
-                  # 3.5 Comprimir thumbnail se > 2MB (limite do YouTube)
-                  if thumb_success and thumb_path and thumb_path.exists():
-                      thumb_file_size = thumb_path.stat().st_size
-                      max_thumb_size = 2 * 1024 * 1024  # 2MB
-                      if thumb_file_size > max_thumb_size:
-                          logger.info(f"   📐 Comprimindo thumbnail ({thumb_file_size/1024:.1f}KB > 2048KB)...")
-                          try:
-                              from PIL import Image
-                              img = Image.open(str(thumb_path))
-                              img = img.convert('RGB')
-                              img = img.resize((1280, 720), Image.LANCZOS)
-                              compressed_path = THUMB_DIR / f"{clip_id}_thumb.jpg"
-                              quality = 95
-                              while quality >= 10:
-                                  img.save(str(compressed_path), 'JPEG', quality=quality, optimize=True)
-                                  if compressed_path.stat().st_size <= max_thumb_size:
-                                      break
-                                  quality -= 5
-                              if compressed_path.exists() and compressed_path.stat().st_size <= max_thumb_size:
-                                  thumb_path.unlink()
-                                  thumb_path = compressed_path
-                                  logger.info(f"   ✅ Thumbnail comprimida: {thumb_path.stat().st_size/1024:.1f}KB (quality={quality})")
-                              else:
-                                  logger.warning(f"   ⚠️ Não foi possível comprimir abaixo de 2MB")
-                          except Exception as e:
-                              logger.warning(f"   ⚠️ Erro ao comprimir: {e}")
-                      logger.info(f"   ✅ Thumbnail pronta: {thumb_path}")
-                  
-                  # 4. Upload para YouTube
+                  # 2. Upload para YouTube
                   video_id = upload_to_youtube(
                       video_path, 
-                      thumb_path if thumb_path and thumb_path.exists() else None, 
                       clip_data, 
                       credentials
                   )
@@ -1099,7 +440,7 @@ jobs:
                   traceback.print_exc()
                   
               finally:
-                  # Limpar vídeo (manter thumbnail para debug)
+                  # Limpar vídeo temporário
                   try:
                       if video_path.exists():
                           video_path.unlink()
@@ -1124,7 +465,6 @@ jobs:
               logger.info(f"📹 VOD: {vod_url}")
               
               TEMP_DIR.mkdir(exist_ok=True)
-              THUMB_DIR.mkdir(exist_ok=True)
               
               try:
                   clips = load_clips_config()
@@ -1158,7 +498,6 @@ jobs:
                   "total": len(results),
                   "success": len([r for r in results if r["status"] == "success"]),
                   "failed": len([r for r in results if r["status"] != "success"]),
-                  "thumbnails_ok": len([r for r in results if r.get("thumbnail_status") == "captured"]),
                   "clips": results
               }
               
@@ -1170,7 +509,6 @@ jobs:
               logger.info("📊 RESUMO FINAL")
               logger.info("=" * 60)
               logger.info(f"   📹 Vídeos: {summary['success']}/{summary['total']} sucesso")
-              logger.info(f"   🖼️  Thumbnails: {summary['thumbnails_ok']}/{summary['total']} capturadas")
               logger.info(f"   ❌ Falhas: {summary['failed']}")
               logger.info("=" * 60)
               
@@ -1192,7 +530,7 @@ jobs:
       - name: 🎬 Processar Clipes
         env:
           VOD_LINK: ${{ github.event.inputs.vod_link }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+
         run: |
           python scripts/clip_creator.py "$VOD_LINK"
 
@@ -1206,17 +544,14 @@ jobs:
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
           
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 🖼️ Thumbnails" >> $GITHUB_STEP_SUMMARY
-          ls -la thumbnails/ 2>/dev/null || echo "Nenhuma thumbnail encontrada"
+
 
       - name: 📤 Upload logs e thumbnails
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-and-thumbnails
+          name: logs
           path: |
             *.log
             processing_log.json
-            thumbnails/
           retention-days: 7
