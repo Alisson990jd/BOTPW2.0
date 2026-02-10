@@ -293,7 +293,7 @@ jobs:
 
                       create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
                       create_image_btn.wait_for(state="visible", timeout=5000)
-                      create_image_btn.click()
+                      create_image_btn.click(force=True)
                       time.sleep(2)
 
                       # ADD IMAGE
