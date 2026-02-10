@@ -45,11 +45,25 @@ jobs:
       - name: 📥 Checkout do repositório
         uses: actions/checkout@v4
 
+      - name: 📝 Criar requirements.txt
+        run: |
+          cat > requirements.txt << 'EOF'
+          google-api-python-client>=2.100.0
+          google-auth>=2.23.0
+          google-auth-oauthlib>=1.1.0
+          google-auth-httplib2>=0.1.1
+          playwright>=1.40.0
+          requests>=2.31.0
+          yt-dlp>=2024.1.0
+          Pillow>=10.0.0
+          EOF
+          echo "✅ requirements.txt criado!"
+          cat requirements.txt
+
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 📦 Instalar dependências do sistema
         run: |
@@ -96,18 +110,552 @@ jobs:
                  "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/$FILE"
           done
           
+          # Baixar arquivos .pkl da pasta analisar
+          PKL_FILES=$(curl -s -H "Authorization: token $GH_PAT" \
+                       -H "Accept: application/vnd.github.v3+json" \
+                       "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar" | \
+                  jq -r '.[] | select(.name | endswith(".pkl")) | .name')
+          
+          for FILE in $PKL_FILES; do
+            echo "  📄 Baixando $FILE..."
+            curl -H "Authorization: token $GH_PAT" \
+                 -H "Accept: application/vnd.github.v3.raw" \
+                 -o "analisar/$FILE" \
+                 "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/$FILE"
+          done
+          
+          echo ""
           echo "✅ Configurações baixadas!"
-          ls -la
+          echo ""
+          echo "📂 Arquivos na raiz:"
+          ls -la *.json *.pkl 2>/dev/null || echo "  (nenhum)"
+          echo ""
+          echo "📂 Arquivos em analisar/:"
           ls -la analisar/
+
+      - name: 📂 Criar pasta de scripts
+        run: |
+          mkdir -p scripts
+          mkdir -p error_screenshots
+          mkdir -p temp_clips
+
+      - name: 📝 Criar script clip_creator.py
+        run: |
+          cat > scripts/clip_creator.py << 'SCRIPT_EOF'
+          #!/usr/bin/env python3
+          """
+          🎬 YouTube Clip Creator
+          Processa clipes do VOD da Twitch e faz upload para o YouTube
+          """
+
+          import os
+          import sys
+          import json
+          import subprocess
+          import pickle
+          import time
+          import shutil
+          import logging
+          from pathlib import Path
+          from datetime import datetime
+          from typing import Optional, Dict, List
+
+          # Configurar logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s | %(levelname)s | %(message)s',
+              handlers=[
+                  logging.StreamHandler(sys.stdout),
+                  logging.FileHandler('clip_creator.log')
+              ]
+          )
+          logger = logging.getLogger(__name__)
+
+          # ==================== CONSTANTES ====================
+          TEMP_DIR = Path("temp_clips")
+          ERROR_SCREENSHOTS_DIR = Path("error_screenshots")
+          PROCESSING_LOG = "processing_log.json"
+
+
+          def setup_directories():
+              """Cria diretórios necessários"""
+              TEMP_DIR.mkdir(exist_ok=True)
+              ERROR_SCREENSHOTS_DIR.mkdir(exist_ok=True)
+
+
+          def time_to_seconds(time_str: str) -> int:
+              """Converte HH:MM:SS para segundos"""
+              parts = time_str.split(':')
+              if len(parts) == 3:
+                  h, m, s = map(int, parts)
+                  return h * 3600 + m * 60 + s
+              elif len(parts) == 2:
+                  m, s = map(int, parts)
+                  return m * 60 + s
+              return int(parts[0])
+
+
+          def seconds_to_time(seconds: int) -> str:
+              """Converte segundos para HH:MM:SS"""
+              h = seconds // 3600
+              m = (seconds % 3600) // 60
+              s = seconds % 60
+              return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+          def load_clips_config() -> List[Dict]:
+              """Carrega e filtra clipes do YouTube do JSON"""
+              logger.info("📂 Carregando configuração de clipes...")
+              
+              with open("analise_resultado.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              
+              clips = data.get("clips", [])
+              youtube_clips = [c for c in clips if c.get("platform") == "youtube"]
+              
+              logger.info(f"   Total de clipes: {len(clips)}")
+              logger.info(f"   Clipes YouTube: {len(youtube_clips)}")
+              
+              return youtube_clips
+
+
+          def load_youtube_credentials() -> Dict:
+              """Carrega credenciais do YouTube da pasta analisar"""
+              logger.info("🔑 Carregando credenciais do YouTube...")
+              
+              analisar_dir = Path("analisar")
+              json_files = list(analisar_dir.glob("*.json"))
+              
+              if not json_files:
+                  raise FileNotFoundError("Nenhum arquivo de credenciais encontrado em 'analisar/'")
+              
+              # Usa o primeiro arquivo encontrado
+              cred_file = json_files[0]
+              logger.info(f"   Usando: {cred_file.name}")
+              
+              with open(cred_file, "r", encoding="utf-8") as f:
+                  cred_data = json.load(f)
+              
+              # Carrega o pickle com o token
+              pkl_name = cred_data.get("pkl_file", "")
+              pkl_file = analisar_dir / pkl_name
+              
+              if not pkl_file.exists():
+                  # Procura qualquer pkl na pasta
+                  pkl_files = list(analisar_dir.glob("*.pkl"))
+                  if pkl_files:
+                      pkl_file = pkl_files[0]
+                      logger.info(f"   Usando pkl encontrado: {pkl_file.name}")
+                  else:
+                      raise FileNotFoundError(f"Arquivo pkl não encontrado: {pkl_name}")
+              
+              return {
+                  "json_data": cred_data,
+                  "json_file": cred_file,
+                  "pkl_file": pkl_file
+              }
+
+
+          def get_vod_info(vod_url: str) -> Dict:
+              """Obtém informações do VOD"""
+              logger.info(f"📹 Obtendo informações do VOD...")
+              
+              result = subprocess.run(
+                  ["yt-dlp", "--dump-json", "--no-download", vod_url],
+                  capture_output=True,
+                  text=True
+              )
+              
+              if result.returncode != 0:
+                  raise Exception(f"Erro ao obter info do VOD: {result.stderr}")
+              
+              info = json.loads(result.stdout)
+              logger.info(f"   Título: {info.get('title', 'N/A')}")
+              logger.info(f"   Duração: {info.get('duration', 0)} segundos")
+              
+              return info
+
+
+          def download_clip_segment(vod_url: str, start_time: str, end_time: str, output_path: Path) -> bool:
+              """Baixa um segmento específico do VOD na melhor qualidade"""
+              logger.info(f"⬇️  Baixando segmento: {start_time} -> {end_time}")
+              
+              # Comando yt-dlp para baixar segmento específico
+              cmd = [
+                  "yt-dlp",
+                  "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                  "--download-sections", f"*{start_time}-{end_time}",
+                  "--force-keyframes-at-cuts",
+                  "--concurrent-fragments", "8",
+                  "--output", str(output_path),
+                  "--no-playlist",
+                  "--no-part",
+                  "--merge-output-format", "mp4",
+                  vod_url
+              ]
+              
+              try:
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                  
+                  if result.returncode == 0 and output_path.exists():
+                      file_size = output_path.stat().st_size / (1024 * 1024)
+                      logger.info(f"   ✅ Segmento baixado: {file_size:.2f} MB")
+                      return True
+                  else:
+                      logger.error(f"   ❌ Erro no download: {result.stderr}")
+                      return False
+                      
+              except subprocess.TimeoutExpired:
+                  logger.error("   ❌ Timeout no download")
+                  return False
+              except Exception as e:
+                  logger.error(f"   ❌ Erro: {e}")
+                  return False
+
+
+          def capture_thumbnail_frame(video_path: Path, timestamp: str, output_path: Path) -> bool:
+              """Captura um frame do vídeo para usar como base da thumbnail"""
+              logger.info(f"📸 Capturando frame em {timestamp}...")
+              
+              cmd = [
+                  "ffmpeg",
+                  "-y",
+                  "-ss", timestamp,
+                  "-i", str(video_path),
+                  "-vframes", "1",
+                  "-q:v", "2",
+                  str(output_path)
+              ]
+              
+              try:
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                  
+                  if result.returncode == 0 and output_path.exists():
+                      logger.info(f"   ✅ Frame capturado!")
+                      return True
+                  else:
+                      logger.error(f"   ❌ Erro na captura: {result.stderr}")
+                      return False
+                      
+              except Exception as e:
+                  logger.error(f"   ❌ Erro: {e}")
+                  return False
+
+
+          def upload_to_youtube(
+              video_path: Path,
+              thumbnail_path: Optional[Path],
+              clip_data: Dict,
+              credentials: Dict
+          ) -> Optional[str]:
+              """Faz upload do vídeo para o YouTube"""
+              
+              logger.info("📤 Fazendo upload para o YouTube...")
+              
+              try:
+                  from google.auth.transport.requests import Request
+                  from googleapiclient.discovery import build
+                  from googleapiclient.http import MediaFileUpload
+                  
+                  # Carrega credenciais
+                  pkl_file = credentials.get("pkl_file")
+                  with open(pkl_file, 'rb') as f:
+                      creds = pickle.load(f)
+                  
+                  # Renova se necessário
+                  if creds and creds.expired and creds.refresh_token:
+                      logger.info("   🔄 Renovando token...")
+                      creds.refresh(Request())
+                      with open(pkl_file, 'wb') as f:
+                          pickle.dump(creds, f)
+                  
+                  # Constrói serviço
+                  service = build('youtube', 'v3', credentials=creds)
+                  
+                  # Prepara dados
+                  title = clip_data.get("title", "Clip")[:100]
+                  description = clip_data.get("recommended_description", "")[:5000]
+                  tags = clip_data.get("tags", [])[:500]
+                  
+                  # Mapeia categoria
+                  category_map = {
+                      "gaming": "20",
+                      "entertainment": "24",
+                      "people": "22",
+                      "comedy": "23",
+                      "IRL": "22",
+                      "react": "24",
+                  }
+                  category = clip_data.get("category", "entertainment").lower()
+                  category_id = category_map.get(category, "22")
+                  
+                  body = {
+                      'snippet': {
+                          'title': title,
+                          'description': description,
+                          'tags': tags,
+                          'categoryId': category_id,
+                      },
+                      'status': {
+                          'privacyStatus': 'private',
+                          'selfDeclaredMadeForKids': False,
+                      }
+                  }
+                  
+                  logger.info(f"   Título: {title}")
+                  logger.info(f"   Tags: {len(tags)}")
+                  
+                  # Upload
+                  media = MediaFileUpload(
+                      str(video_path),
+                      chunksize=1024*1024,
+                      resumable=True,
+                      mimetype='video/mp4'
+                  )
+                  
+                  insert_request = service.videos().insert(
+                      part=','.join(body.keys()),
+                      body=body,
+                      media_body=media
+                  )
+                  
+                  response = None
+                  while response is None:
+                      status, response = insert_request.next_chunk()
+                      if status:
+                          progress = int(status.progress() * 100)
+                          logger.info(f"   Progresso: {progress}%")
+                  
+                  video_id = response.get('id')
+                  
+                  if video_id:
+                      logger.info(f"   ✅ Upload concluído! ID: {video_id}")
+                      logger.info(f"   URL: https://youtube.com/watch?v={video_id}")
+                      
+                      # Tenta definir thumbnail
+                      if thumbnail_path and thumbnail_path.exists():
+                          try:
+                              thumb_media = MediaFileUpload(
+                                  str(thumbnail_path),
+                                  mimetype='image/png',
+                                  resumable=True
+                              )
+                              service.thumbnails().set(
+                                  videoId=video_id,
+                                  media_body=thumb_media
+                              ).execute()
+                              logger.info("   ✅ Thumbnail configurada!")
+                          except Exception as e:
+                              logger.warning(f"   ⚠️ Erro na thumbnail: {e}")
+                      
+                      return video_id
+                  
+                  return None
+                  
+              except Exception as e:
+                  logger.error(f"   ❌ Erro no upload: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  return None
+
+
+          def cleanup_temp_files(*paths):
+              """Remove arquivos temporários"""
+              for path in paths:
+                  try:
+                      if isinstance(path, Path) and path.exists():
+                          path.unlink()
+                          logger.debug(f"   🗑️ Removido: {path}")
+                  except Exception as e:
+                      logger.warning(f"   ⚠️ Erro ao remover {path}: {e}")
+
+
+          def process_clip(clip_data: Dict, vod_url: str, credentials: Dict, clip_index: int, total_clips: int) -> Dict:
+              """Processa um único clipe"""
+              clip_id = clip_data.get("clip_id", f"clip_{clip_index}")
+              
+              logger.info("")
+              logger.info("=" * 60)
+              logger.info(f"🎬 Processando clipe {clip_index + 1}/{total_clips}: {clip_id}")
+              logger.info(f"   Título: {clip_data.get('title', 'N/A')}")
+              logger.info(f"   Duração: {clip_data.get('duration_seconds', 0)}s")
+              logger.info(f"   Tempo: {clip_data.get('start_time')} -> {clip_data.get('end_time')}")
+              logger.info("=" * 60)
+              
+              result = {
+                  "clip_id": clip_id,
+                  "title": clip_data.get("title"),
+                  "status": "pending",
+                  "video_id": None,
+                  "error": None
+              }
+              
+              # Paths temporários
+              video_path = TEMP_DIR / f"{clip_id}.mp4"
+              frame_path = TEMP_DIR / f"{clip_id}_frame.png"
+              
+              try:
+                  # 1. Baixar segmento do VOD
+                  if not download_clip_segment(
+                      vod_url,
+                      clip_data.get("start_time", "00:00:00"),
+                      clip_data.get("end_time", "00:01:00"),
+                      video_path
+                  ):
+                      result["status"] = "failed"
+                      result["error"] = "Falha no download do segmento"
+                      return result
+                  
+                  # 2. Capturar frame para thumbnail
+                  thumbnail_timestamp = clip_data.get("thumbnail_timestamp", clip_data.get("start_time", "00:00:00"))
+                  
+                  # Calcula o timestamp relativo ao início do clipe
+                  start_sec = time_to_seconds(clip_data.get("start_time", "00:00:00"))
+                  thumb_sec = time_to_seconds(thumbnail_timestamp)
+                  relative_thumb_sec = max(0, thumb_sec - start_sec)
+                  relative_thumb = seconds_to_time(relative_thumb_sec)
+                  
+                  capture_thumbnail_frame(video_path, relative_thumb, frame_path)
+                  
+                  # 3. Upload para YouTube
+                  video_id = upload_to_youtube(
+                      video_path,
+                      frame_path if frame_path.exists() else None,
+                      clip_data,
+                      credentials
+                  )
+                  
+                  if video_id:
+                      result["status"] = "success"
+                      result["video_id"] = video_id
+                  else:
+                      result["status"] = "failed"
+                      result["error"] = "Falha no upload"
+                  
+              except Exception as e:
+                  result["status"] = "error"
+                  result["error"] = str(e)
+                  logger.error(f"   ❌ Erro ao processar clipe: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  
+              finally:
+                  # Limpar arquivos temporários
+                  cleanup_temp_files(video_path, frame_path)
+              
+              return result
+
+
+          def save_processing_log(results: List[Dict]):
+              """Salva log de processamento"""
+              summary = {
+                  "processed_at": datetime.now().isoformat(),
+                  "total_clips": len(results),
+                  "successful": len([r for r in results if r["status"] == "success"]),
+                  "failed": len([r for r in results if r["status"] in ["failed", "error"]]),
+                  "clips": results
+              }
+              
+              with open(PROCESSING_LOG, "w", encoding="utf-8") as f:
+                  json.dump(summary, f, indent=2, ensure_ascii=False)
+              
+              logger.info(f"📝 Log salvo em {PROCESSING_LOG}")
+              return summary
+
+
+          def main():
+              """Função principal"""
+              logger.info("")
+              logger.info("=" * 60)
+              logger.info("   🎬 YOUTUBE CLIP CREATOR - INICIANDO")
+              logger.info("=" * 60)
+              
+              if len(sys.argv) < 2:
+                  logger.error("❌ Uso: python clip_creator.py <VOD_URL>")
+                  sys.exit(1)
+              
+              vod_url = sys.argv[1]
+              logger.info(f"📹 VOD URL: {vod_url}")
+              
+              # Setup
+              setup_directories()
+              
+              # Carregar configurações
+              try:
+                  youtube_clips = load_clips_config()
+                  credentials = load_youtube_credentials()
+              except Exception as e:
+                  logger.error(f"❌ Erro ao carregar configurações: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  sys.exit(1)
+              
+              if not youtube_clips:
+                  logger.warning("⚠️ Nenhum clipe do YouTube encontrado para processar!")
+                  save_processing_log([])
+                  sys.exit(0)
+              
+              logger.info(f"📋 {len(youtube_clips)} clipes para processar")
+              
+              # Obter info do VOD
+              try:
+                  vod_info = get_vod_info(vod_url)
+              except Exception as e:
+                  logger.error(f"❌ Erro ao obter info do VOD: {e}")
+                  sys.exit(1)
+              
+              # Processar cada clipe
+              results = []
+              total = len(youtube_clips)
+              
+              for i, clip in enumerate(youtube_clips):
+                  result = process_clip(clip, vod_url, credentials, i, total)
+                  results.append(result)
+                  
+                  # Pequena pausa entre uploads para evitar rate limiting
+                  if result["status"] == "success" and i < total - 1:
+                      logger.info("⏳ Aguardando 10 segundos antes do próximo clipe...")
+                      time.sleep(10)
+              
+              # Salvar resumo
+              summary = save_processing_log(results)
+              
+              # Relatório final
+              logger.info("")
+              logger.info("=" * 60)
+              logger.info("   📊 RESUMO FINAL")
+              logger.info("=" * 60)
+              logger.info(f"   Total processado: {summary['total_clips']}")
+              logger.info(f"   ✅ Sucesso: {summary['successful']}")
+              logger.info(f"   ❌ Falhas: {summary['failed']}")
+              logger.info("=" * 60)
+              
+              logger.info("🎉 Processamento concluído!")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except KeyboardInterrupt:
+                  logger.warning("\n⚠️ Operação cancelada pelo usuário")
+                  sys.exit(130)
+              except Exception as e:
+                  logger.error(f"❌ Erro fatal: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  sys.exit(1)
+          SCRIPT_EOF
+          
+          chmod +x scripts/clip_creator.py
+          echo "✅ Script clip_creator.py criado!"
 
       - name: 🎬 Processar Clipes
         env:
           VOD_LINK: ${{ github.event.inputs.vod_link }}
           DISPLAY: ':99'
         run: |
-          # Iniciar Xvfb para Playwright
-          Xvfb :99 -screen 0 1920x1080x24 &
-          sleep 2
+          echo "🚀 Iniciando processamento..."
+          echo "VOD: $VOD_LINK"
           
           python scripts/clip_creator.py "$VOD_LINK"
 
@@ -115,10 +663,13 @@ jobs:
         if: always()
         run: |
           echo "## 📊 Resumo do Processamento" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f "processing_log.json" ]; then
             echo '```json' >> $GITHUB_STEP_SUMMARY
             cat processing_log.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Nenhum log encontrado" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: 📤 Upload de logs
@@ -129,5 +680,4 @@ jobs:
           path: |
             *.log
             processing_log.json
-            error_screenshots/
           retention-days: 7
