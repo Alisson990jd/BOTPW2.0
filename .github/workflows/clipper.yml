@@ -55,6 +55,7 @@ jobs:
           requests>=2.31.0
           yt-dlp>=2024.1.0
           Pillow>=10.0.0
+          playwright>=1.40.0
           EOF
           echo "✅ requirements.txt criado!"
 
@@ -73,6 +74,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
 
       - name: 📥 Baixar configurações do repositório externo
         env:
@@ -125,6 +128,319 @@ jobs:
       - name: 📂 Criar diretórios
         run: |
           mkdir -p scripts temp_clips thumbnails
+
+      - name: 📝 Criar script ChatGPT Thumbnail
+        run: |
+          cat > scripts/chatgpt_thumbnail.py << 'CHATGPT_EOF'
+          #!/usr/bin/env python3
+          """
+          🎨 ChatGPT Thumbnail Generator
+          Gera thumbnails via ChatGPT usando Playwright
+          """
+          import os
+          import sys
+          import re
+          import time
+          import json
+          import pickle
+          import base64
+          import argparse
+          import logging
+          import requests
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from playwright.sync_api import sync_playwright
+
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+          logger = logging.getLogger(__name__)
+
+          EMAIL_ADDRESS = "expulsion-flip-elk@duck.com"
+          TOKEN_PICKLE = "gmail_token.pkl"
+          CHATGPT_URL = "https://chatgpt.com/"
+
+
+          def get_gmail_service():
+              if not os.path.exists(TOKEN_PICKLE):
+                  raise FileNotFoundError(f"'{TOKEN_PICKLE}' não encontrado!")
+              with open(TOKEN_PICKLE, 'rb') as token:
+                  creds = pickle.load(token)
+              if creds and creds.expired and creds.refresh_token:
+                  logger.info("🔄 Renovando token do Gmail...")
+                  creds.refresh(Request())
+                  with open(TOKEN_PICKLE, 'wb') as token:
+                      pickle.dump(creds, token)
+              return build('gmail', 'v1', credentials=creds)
+
+
+          def get_chatgpt_code(service, max_attempts=30, interval=2):
+              logger.info("📧 Aguardando email com código do ChatGPT...")
+              start_time = datetime.now(timezone.utc)
+              for attempt in range(max_attempts):
+                  query = "from:noreply@tm.openai.com subject:Your ChatGPT code is"
+                  results = service.users().messages().list(userId='me', q=query, maxResults=5).execute()
+                  for msg in results.get('messages', []):
+                      message = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
+                      internal_date = int(message.get('internalDate', 0)) / 1000
+                      email_time = datetime.fromtimestamp(internal_date, tz=timezone.utc)
+                      if email_time < start_time:
+                          continue
+                      headers = message['payload'].get('headers', [])
+                      subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), '')
+                      match = re.search(r'Your ChatGPT code is (\d{6})', subject)
+                      if match:
+                          code = match.group(1)
+                          logger.info(f"✅ Código encontrado: {code}")
+                          return code
+                  time.sleep(interval)
+              raise TimeoutError("❌ Tempo esgotado aguardando código.")
+
+
+          def mark_email_as_read(service):
+              query = "from:noreply@tm.openai.com subject:Your ChatGPT code is is:unread"
+              results = service.users().messages().list(userId='me', q=query).execute()
+              for msg in results.get('messages', []):
+                  service.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
+
+
+          def download_image_direct(url, cookies, user_agent, output_path):
+              cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+              headers = {"Cookie": cookie_str, "User-Agent": user_agent, "Referer": "https://chatgpt.com/"}
+              response = requests.get(url, headers=headers, stream=True)
+              if response.status_code == 200:
+                  with open(output_path, 'wb') as f:
+                      for chunk in response.iter_content(chunk_size=8192):
+                          f.write(chunk)
+                  return True
+              return False
+
+
+          def generate_thumbnail(image_path, output_path, clip_json_str):
+              logger.info("🎨 Iniciando geração de thumbnail via ChatGPT...")
+              image_path = os.path.abspath(image_path)
+              if not os.path.exists(image_path):
+                  logger.error(f"❌ Imagem não encontrada: {image_path}")
+                  return False
+
+              prompt = f"transforme em uma thumbnail para youtube(1280x720), esse é o clipe:\n{clip_json_str}"
+
+              gmail_service = get_gmail_service()
+              logger.info("✅ Gmail conectado!")
+
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(
+                      headless=True,
+                      args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
+                  )
+                  context = browser.new_context(
+                      accept_downloads=True,
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                      locale='en-US',
+                      viewport={'width': 1280, 'height': 720}
+                  )
+                  page = context.new_page()
+                  page.set_default_timeout(60000)
+
+                  try:
+                      # LOGIN
+                      logger.info("🔗 Acessando ChatGPT...")
+                      page.goto(CHATGPT_URL, wait_until='networkidle')
+                      login_button = page.locator('[data-testid="login-button"]')
+                      login_button.wait_for(state='visible')
+                      login_button.click()
+
+                      email_input = page.locator('input[name="email"]')
+                      email_input.wait_for(state='visible')
+                      time.sleep(0.3)
+                      email_input.fill(EMAIL_ADDRESS)
+
+                      continue_button = page.locator('button[type="submit"]:has-text("Continue")')
+                      continue_button.wait_for(state='visible')
+                      time.sleep(0.5)
+                      continue_button.click()
+
+                      code = get_chatgpt_code(gmail_service)
+
+                      code_input = page.locator('input[name="code"]')
+                      code_input.wait_for(state='visible')
+                      time.sleep(0.5)
+                      code_input.fill(code)
+
+                      validate_button = page.locator('button[name="intent"][value="validate"]')
+                      validate_button.wait_for(state='visible')
+                      time.sleep(0.3)
+                      validate_button.click()
+
+                      page.wait_for_url("**/", timeout=30000)
+                      time.sleep(3)
+                      logger.info("🎉 LOGIN OK!")
+
+                      try:
+                          mark_email_as_read(gmail_service)
+                      except:
+                          pass
+
+                      # CREATE IMAGE MODE
+                      page.goto(CHATGPT_URL, wait_until='domcontentloaded')
+                      time.sleep(3)
+
+                      plus_btn = page.locator('[data-testid="composer-plus-btn"]')
+                      plus_btn.wait_for(state="visible", timeout=15000)
+                      plus_btn.click()
+                      time.sleep(1)
+
+                      create_image_btn = page.locator('div[role="menuitemradio"]:has-text("Create image")')
+                      create_image_btn.wait_for(state="visible", timeout=5000)
+                      create_image_btn.click()
+                      time.sleep(2)
+
+                      # ADD IMAGE
+                      image_added = False
+                      try:
+                          plus_btn = page.locator('[data-testid="composer-plus-btn"]')
+                          plus_btn.wait_for(state="visible", timeout=5000)
+                          plus_btn.click()
+                          time.sleep(1)
+                          for selector in ['div[role="menuitemradio"]:has-text("Add photos")', 'div[role="menuitemradio"]:has-text("Upload")']:
+                              try:
+                                  btn = page.locator(selector).first
+                                  if btn.is_visible(timeout=1000):
+                                      with page.expect_file_chooser() as fc_info:
+                                          btn.click()
+                                      fc_info.value.set_files(image_path)
+                                      image_added = True
+                                      time.sleep(2)
+                                      break
+                              except:
+                                  continue
+                      except Exception as e:
+                          logger.warning(f"Método 1 falhou: {e}")
+
+                      if not image_added:
+                          try:
+                              file_input = page.locator('input[type="file"]').first
+                              file_input.set_input_files(image_path)
+                              image_added = True
+                              time.sleep(2)
+                          except Exception as e:
+                              logger.warning(f"Método 2 falhou: {e}")
+
+                      if not image_added:
+                          try:
+                              with open(image_path, 'rb') as f:
+                                  file_content = base64.b64encode(f.read()).decode()
+                              file_name = os.path.basename(image_path)
+                              page.evaluate(f'''() => {{
+                                  const base64 = "{file_content}";
+                                  const binaryString = atob(base64);
+                                  const bytes = new Uint8Array(binaryString.length);
+                                  for (let i = 0; i < binaryString.length; i++) {{ bytes[i] = binaryString.charCodeAt(i); }}
+                                  const blob = new Blob([bytes], {{ type: "image/png" }});
+                                  const file = new File([blob], "{file_name}", {{ type: "image/png" }});
+                                  const target = document.querySelector("#prompt-textarea") || document.querySelector("[contenteditable]");
+                                  if (!target) return false;
+                                  const dt = new DataTransfer();
+                                  dt.items.add(file);
+                                  ["dragenter","dragover","drop"].forEach(t => {{
+                                      target.dispatchEvent(new DragEvent(t, {{ bubbles:true, cancelable:true, dataTransfer:dt }}));
+                                  }});
+                                  return true;
+                              }}''')
+                              image_added = True
+                              time.sleep(3)
+                          except Exception as e:
+                              logger.warning(f"Método 3 falhou: {e}")
+
+                      if not image_added:
+                          logger.error("❌ Não foi possível adicionar a imagem")
+                          return False
+
+                      # SEND PROMPT
+                      time.sleep(1)
+                      textarea = page.locator('#prompt-textarea')
+                      textarea.wait_for(state="visible", timeout=5000)
+                      textarea.click()
+                      time.sleep(0.5)
+
+                      safe_prompt = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                      page.evaluate(f'''() => {{
+                          const textarea = document.querySelector("#prompt-textarea");
+                          if (!textarea) return;
+                          const p = textarea.querySelector("p");
+                          if (p) {{ p.innerHTML = "{safe_prompt}"; }}
+                          else {{ textarea.innerHTML = "<p>{safe_prompt}</p>"; }}
+                          textarea.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                      }}''')
+                      time.sleep(1)
+
+                      send_btn = page.locator('#composer-submit-button')
+                      send_btn.wait_for(state="visible", timeout=5000)
+                      send_btn.click()
+                      logger.info("✅ Prompt enviado! Aguardando geração (~4 min)...")
+
+                      # WAIT FOR GENERATION
+                      for remaining in range(240, 0, -10):
+                          mins, secs = divmod(remaining, 60)
+                          logger.info(f"   ⏳ Restante: {mins:02d}:{secs:02d}")
+                          time.sleep(10)
+
+                      # DOWNLOAD IMAGE
+                      time.sleep(3)
+                      image_containers = page.locator('div[class*="group/imagegen-image"]').all()
+                      logger.info(f"📷 {len(image_containers)} containers encontrados")
+
+                      if len(image_containers) > 0:
+                          last_container = image_containers[-1]
+                          last_container.hover()
+                          time.sleep(1)
+                          download_btn = last_container.locator('button[aria-label="Download this image"]')
+                          download_btn.wait_for(state="visible", timeout=5000)
+
+                          with page.expect_download(timeout=60000) as download_info:
+                              download_btn.click()
+                          download_info.value.save_as(output_path)
+                          logger.info(f"✅ Thumbnail gerada: {output_path}")
+                          return True
+                      else:
+                          # Fallback: download direto da URL
+                          img_url = page.evaluate('''() => {
+                              const c = document.querySelectorAll('div[class*="group/imagegen-image"]');
+                              if (c.length > 0) { const img = c[c.length-1].querySelector('img[alt="Generated image"]'); return img ? img.src : null; }
+                              return null;
+                          }''')
+                          if img_url:
+                              cookies = context.cookies()
+                              ua = page.evaluate("navigator.userAgent")
+                              if download_image_direct(img_url, cookies, ua, output_path):
+                                  logger.info(f"✅ Thumbnail baixada via URL: {output_path}")
+                                  return True
+                          logger.error("❌ Nenhuma imagem encontrada")
+                          return False
+
+                  except Exception as e:
+                      logger.error(f"❌ Erro: {e}")
+                      try:
+                          page.screenshot(path='chatgpt_error.png')
+                      except:
+                          pass
+                      return False
+                  finally:
+                      browser.close()
+
+
+          if __name__ == "__main__":
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--image", required=True)
+              parser.add_argument("--output", required=True)
+              parser.add_argument("--clip-json", required=True)
+              args = parser.parse_args()
+              success = generate_thumbnail(args.image, args.output, args.clip_json)
+              sys.exit(0 if success else 1)
+          CHATGPT_EOF
+
+          chmod +x scripts/chatgpt_thumbnail.py
 
       - name: 📝 Criar script otimizado
         run: |
@@ -510,23 +826,67 @@ jobs:
                       result["error"] = "Download falhou"
                       return result
                   
-                  # 2. Captura da thumbnail
+                  # 2. Captura screenshot do VOD para usar como base
                   thumb_ts = clip_data.get("thumbnail_timestamp", clip_data.get("start_time"))
                   start_sec = time_to_seconds(clip_data.get("start_time", "00:00:00"))
                   thumb_sec = time_to_seconds(thumb_ts)
                   rel_thumb = seconds_to_time(max(0, thumb_sec - start_sec))
                   
-                  thumb_success = capture_thumbnail(video_path, rel_thumb, thumb_path)
+                  screenshot_path = THUMB_DIR / f"{clip_id}_screenshot.png"
+                  screenshot_ok = capture_thumbnail(video_path, rel_thumb, screenshot_path)
                   
-                  if thumb_success and thumb_path.exists():
-                      result["thumbnail_status"] = "captured"
+                  # 3. Gera thumbnail via ChatGPT (com fallback para screenshot)
+                  thumb_success = False
+                  if screenshot_ok and screenshot_path.exists():
+                      logger.info(f"   🎨 Gerando thumbnail via ChatGPT...")
+                      clip_json_str = json.dumps(clip_data, ensure_ascii=False, indent=2)
+                      try:
+                          chatgpt_result = subprocess.run(
+                              [
+                                  sys.executable, "scripts/chatgpt_thumbnail.py",
+                                  "--image", str(screenshot_path),
+                                  "--output", str(thumb_path),
+                                  "--clip-json", clip_json_str
+                              ],
+                              capture_output=True, text=True, timeout=600
+                          )
+                          if chatgpt_result.returncode == 0 and thumb_path.exists():
+                              thumb_success = True
+                              result["thumbnail_status"] = "chatgpt_generated"
+                              logger.info(f"   ✅ Thumbnail gerada via ChatGPT!")
+                          else:
+                              logger.warning(f"   ⚠️ ChatGPT falhou, usando screenshot como fallback")
+                              logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
+                              logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
+                      except subprocess.TimeoutExpired:
+                          logger.warning("   ⚠️ ChatGPT timeout, usando screenshot como fallback")
+                      except Exception as e:
+                          logger.warning(f"   ⚠️ ChatGPT erro: {e}, usando screenshot como fallback")
+                  
+                  # Fallback: usa screenshot original
+                  if not thumb_success:
+                      if screenshot_ok and screenshot_path.exists():
+                          import shutil
+                          shutil.copy2(str(screenshot_path), str(thumb_path))
+                          thumb_success = True
+                          result["thumbnail_status"] = "screenshot_fallback"
+                          logger.info(f"   ✅ Usando screenshot como thumbnail (fallback)")
+                      else:
+                          result["thumbnail_status"] = "failed"
+                          logger.warning(f"   ⚠️ Thumbnail não capturada")
+                          thumb_path = None
+                  
+                  # Limpar screenshot temporário
+                  try:
+                      if screenshot_path.exists():
+                          screenshot_path.unlink()
+                  except:
+                      pass
+                  
+                  if thumb_success and thumb_path and thumb_path.exists():
                       logger.info(f"   ✅ Thumbnail pronta: {thumb_path}")
-                  else:
-                      result["thumbnail_status"] = "failed"
-                      logger.warning(f"   ⚠️ Thumbnail não capturada")
-                      thumb_path = None
                   
-                  # 3. Upload para YouTube
+                  # 4. Upload para YouTube
                   video_id = upload_to_youtube(
                       video_path, 
                       thumb_path if thumb_path and thumb_path.exists() else None, 
