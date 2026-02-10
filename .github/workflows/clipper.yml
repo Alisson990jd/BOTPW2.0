@@ -48,14 +48,14 @@ jobs:
       - name: 📝 Criar requirements.txt
         run: |
           cat > requirements.txt << 'EOF'
-          google-api-python-client>=2.100.0
-          google-auth>=2.23.0
-          google-auth-oauthlib>=1.1.0
-          google-auth-httplib2>=0.1.1
-          requests>=2.31.0
-          yt-dlp>=2024.1.0
-          Pillow>=10.0.0
-          playwright>=1.40.0
+          google-api-python-client
+          google-auth
+          google-auth-oauthlib
+          google-auth-httplib2
+          requests
+          yt-dlp
+          Pillow
+          playwright
           EOF
           echo "✅ requirements.txt criado!"
 
