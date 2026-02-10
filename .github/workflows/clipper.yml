@@ -157,6 +157,9 @@ jobs:
           logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
           logger = logging.getLogger(__name__)
 
+          DEBUG_DIR = Path("chatgpt_debug")
+          DEBUG_DIR.mkdir(exist_ok=True)
+
           EMAIL_ADDRESS = "expulsion-flip-elk@duck.com"
           TOKEN_PICKLE = "gmail_token.pkl"
           CHATGPT_URL = "https://chatgpt.com/"
@@ -238,7 +241,9 @@ jobs:
                       accept_downloads=True,
                       user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                       locale='en-US',
-                      viewport={'width': 1280, 'height': 720}
+                      viewport={'width': 1280, 'height': 720},
+                      record_video_dir=str(DEBUG_DIR),
+                      record_video_size={'width': 1280, 'height': 720}
                   )
                   page = context.new_page()
                   page.set_default_timeout(60000)
@@ -247,19 +252,30 @@ jobs:
                       # LOGIN
                       logger.info("🔗 Acessando ChatGPT...")
                       page.goto(CHATGPT_URL, wait_until='networkidle')
+                      page.screenshot(path=str(DEBUG_DIR / '01_pagina_inicial.png'))
+                      logger.info("📸 Screenshot: 01_pagina_inicial.png")
+
                       login_button = page.locator('[data-testid="login-button"]')
                       login_button.wait_for(state='visible')
                       login_button.click()
+                      time.sleep(2)
+                      page.screenshot(path=str(DEBUG_DIR / '02_apos_login_click.png'))
+                      logger.info("📸 Screenshot: 02_apos_login_click.png")
 
                       email_input = page.locator('input[name="email"]')
                       email_input.wait_for(state='visible')
                       time.sleep(0.3)
                       email_input.fill(EMAIL_ADDRESS)
+                      page.screenshot(path=str(DEBUG_DIR / '03_email_preenchido.png'))
+                      logger.info("📸 Screenshot: 03_email_preenchido.png")
 
                       continue_button = page.locator('button[type="submit"]:has-text("Continue")')
                       continue_button.wait_for(state='visible')
                       time.sleep(0.5)
                       continue_button.click()
+                      time.sleep(2)
+                      page.screenshot(path=str(DEBUG_DIR / '04_apos_continue.png'))
+                      logger.info("📸 Screenshot: 04_apos_continue.png")
 
                       code = get_chatgpt_code(gmail_service)
 
@@ -422,12 +438,21 @@ jobs:
                   except Exception as e:
                       logger.error(f"❌ Erro: {e}")
                       try:
-                          page.screenshot(path='chatgpt_error.png')
+                          page.screenshot(path=str(DEBUG_DIR / '99_erro.png'))
+                          logger.info("📸 Screenshot de erro salva")
                       except:
                           pass
                       return False
                   finally:
+                      try:
+                          page.close()
+                          context.close()
+                      except:
+                          pass
                       browser.close()
+                      logger.info(f"📁 Arquivos de debug em: {DEBUG_DIR}")
+                      for f in DEBUG_DIR.iterdir():
+                          logger.info(f"   📄 {f.name} ({f.stat().st_size / 1024:.1f}KB)")
 
 
           if __name__ == "__main__":
@@ -657,6 +682,40 @@ jobs:
                   return False
 
 
+          def compress_thumbnail_for_youtube(thumb_path: Path, max_bytes: int = 2_000_000) -> Path:
+              """Comprime thumbnail para ficar abaixo do limite de 2MB do YouTube"""
+              if thumb_path.stat().st_size <= max_bytes:
+                  return thumb_path
+              
+              logger.info(f"   🗜️ Thumbnail muito grande ({thumb_path.stat().st_size/1024:.1f}KB), comprimindo...")
+              from PIL import Image
+              
+              compressed_path = thumb_path.with_suffix('.jpg')
+              img = Image.open(thumb_path)
+              
+              # Garantir RGB (JPEG não suporta alpha)
+              if img.mode in ('RGBA', 'P'):
+                  img = img.convert('RGB')
+              
+              # Redimensionar para 1280x720 se maior
+              if img.width > 1280 or img.height > 720:
+                  img = img.resize((1280, 720), Image.LANCZOS)
+              
+              # Tentar qualidades progressivamente menores
+              for quality in [95, 90, 85, 80, 75, 70, 60, 50]:
+                  img.save(compressed_path, 'JPEG', quality=quality, optimize=True)
+                  size = compressed_path.stat().st_size
+                  if size <= max_bytes:
+                      logger.info(f"   ✅ Comprimida: {size/1024:.1f}KB (qualidade={quality})")
+                      return compressed_path
+              
+              # Último recurso: reduzir resolução
+              img = img.resize((960, 540), Image.LANCZOS)
+              img.save(compressed_path, 'JPEG', quality=70, optimize=True)
+              logger.info(f"   ✅ Comprimida com resolução reduzida: {compressed_path.stat().st_size/1024:.1f}KB")
+              return compressed_path
+
+
           def upload_to_youtube(video_path: Path, thumb_path: Optional[Path], clip_data: Dict, credentials: Dict) -> Optional[str]:
               """Upload para YouTube com thumbnail"""
               logger.info("📤 Upload para YouTube...")
@@ -741,16 +800,20 @@ jobs:
                   
                   # Upload da thumbnail
                   if thumb_path and thumb_path.exists():
-                      thumb_size = thumb_path.stat().st_size
+                      # Comprimir thumbnail se maior que 2MB (limite do YouTube)
+                      thumb_path_to_upload = compress_thumbnail_for_youtube(thumb_path)
+                      thumb_size = thumb_path_to_upload.stat().st_size
                       logger.info(f"   🖼️ Enviando thumbnail ({thumb_size/1024:.1f}KB)...")
                       
                       if thumb_size < 100:
                           logger.error(f"   ❌ Thumbnail muito pequena ({thumb_size} bytes)")
                       else:
+                          # Determinar mimetype baseado na extensão
+                          mime = 'image/jpeg' if str(thumb_path_to_upload).lower().endswith('.jpg') else 'image/png'
                           try:
                               thumb_media = MediaFileUpload(
-                                  str(thumb_path), 
-                                  mimetype='image/png',
+                                  str(thumb_path_to_upload), 
+                                  mimetype=mime,
                                   resumable=False
                               )
                               
@@ -835,47 +898,44 @@ jobs:
                   screenshot_path = THUMB_DIR / f"{clip_id}_screenshot.png"
                   screenshot_ok = capture_thumbnail(video_path, rel_thumb, screenshot_path)
                   
-                  # 3. Gera thumbnail via ChatGPT (com fallback para screenshot)
+                  # 3. Gera thumbnail via ChatGPT (retry infinito até conseguir)
                   thumb_success = False
                   if screenshot_ok and screenshot_path.exists():
-                      logger.info(f"   🎨 Gerando thumbnail via ChatGPT...")
                       clip_json_str = json.dumps(clip_data, ensure_ascii=False, indent=2)
-                      try:
-                          chatgpt_result = subprocess.run(
-                              [
-                                  "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
-                                  sys.executable, "scripts/chatgpt_thumbnail.py",
-                                  "--image", str(screenshot_path),
-                                  "--output", str(thumb_path),
-                                  "--clip-json", clip_json_str
-                              ],
-                              capture_output=True, text=True, timeout=600
-                          )
-                          if chatgpt_result.returncode == 0 and thumb_path.exists():
-                              thumb_success = True
-                              result["thumbnail_status"] = "chatgpt_generated"
-                              logger.info(f"   ✅ Thumbnail gerada via ChatGPT!")
-                          else:
-                              logger.warning(f"   ⚠️ ChatGPT falhou, usando screenshot como fallback")
-                              logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
-                              logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
-                      except subprocess.TimeoutExpired:
-                          logger.warning("   ⚠️ ChatGPT timeout, usando screenshot como fallback")
-                      except Exception as e:
-                          logger.warning(f"   ⚠️ ChatGPT erro: {e}, usando screenshot como fallback")
-                  
-                  # Fallback: usa screenshot original
-                  if not thumb_success:
-                      if screenshot_ok and screenshot_path.exists():
-                          import shutil
-                          shutil.copy2(str(screenshot_path), str(thumb_path))
-                          thumb_success = True
-                          result["thumbnail_status"] = "screenshot_fallback"
-                          logger.info(f"   ✅ Usando screenshot como thumbnail (fallback)")
-                      else:
-                          result["thumbnail_status"] = "failed"
-                          logger.warning(f"   ⚠️ Thumbnail não capturada")
-                          thumb_path = None
+                      attempt = 0
+                      while not thumb_success:
+                          attempt += 1
+                          logger.info(f"   🎨 Gerando thumbnail via ChatGPT... (tentativa {attempt})")
+                          try:
+                              chatgpt_result = subprocess.run(
+                                  [
+                                      "xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24",
+                                      sys.executable, "scripts/chatgpt_thumbnail.py",
+                                      "--image", str(screenshot_path),
+                                      "--output", str(thumb_path),
+                                      "--clip-json", clip_json_str
+                                  ],
+                                  capture_output=True, text=True, timeout=600
+                              )
+                              if chatgpt_result.returncode == 0 and thumb_path.exists():
+                                  thumb_success = True
+                                  result["thumbnail_status"] = "chatgpt_generated"
+                                  logger.info(f"   ✅ Thumbnail gerada via ChatGPT! (tentativa {attempt})")
+                              else:
+                                  logger.warning(f"   ⚠️ ChatGPT falhou na tentativa {attempt}, tentando novamente em 10s...")
+                                  logger.warning(f"   stdout: {chatgpt_result.stdout[-500:] if chatgpt_result.stdout else 'N/A'}")
+                                  logger.warning(f"   stderr: {chatgpt_result.stderr[-500:] if chatgpt_result.stderr else 'N/A'}")
+                                  time.sleep(10)
+                          except subprocess.TimeoutExpired:
+                              logger.warning(f"   ⚠️ ChatGPT timeout na tentativa {attempt}, tentando novamente em 10s...")
+                              time.sleep(10)
+                          except Exception as e:
+                              logger.warning(f"   ⚠️ ChatGPT erro na tentativa {attempt}: {e}, tentando novamente em 10s...")
+                              time.sleep(10)
+                  else:
+                      result["thumbnail_status"] = "failed"
+                      logger.warning(f"   ⚠️ Screenshot não capturada, impossível gerar thumbnail")
+                      thumb_path = None
                   
                   # Limpar screenshot temporário
                   try:
@@ -1030,4 +1090,6 @@ jobs:
             *.log
             processing_log.json
             thumbnails/
+            chatgpt_debug/
+            chatgpt_error.png
           retention-days: 7
