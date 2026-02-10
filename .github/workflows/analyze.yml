@@ -51,7 +51,7 @@ jobs:
           ##############################################################
           # CONFIGURAÇÕES
           ##############################################################
-          ANALYSIS_FILE="analisar/analise_completa.txt"
+          ANALYSIS_FILE="analise_completa.txt"
           KEYS_FILE="gemini_keys_only.txt"
           KEY_MAP_FILE="key_project_map.json"
           USAGE_FILE="key_usage.json"
