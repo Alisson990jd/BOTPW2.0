@@ -54,6 +54,7 @@ jobs:
           google-auth-httplib2>=0.1.1
           requests>=2.31.0
           yt-dlp>=2024.1.0
+          Pillow>=10.0.0
           EOF
           echo "✅ requirements.txt criado!"
 
@@ -66,10 +67,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2
-          
-          # Verificar aria2
           aria2c --version | head -1
-          echo "✅ aria2 instalado!"
           
       - name: 📦 Instalar dependências Python
         run: |
@@ -95,7 +93,6 @@ jobs:
           echo "📥 Baixando arquivos da pasta analisar..."
           mkdir -p analisar
           
-          # Listar e baixar arquivos JSON
           FILES=$(curl -s -H "Authorization: token $GH_PAT" \
                        -H "Accept: application/vnd.github.v3+json" \
                        "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar" | \
@@ -109,7 +106,6 @@ jobs:
                  "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar/$FILE"
           done
           
-          # Baixar arquivos PKL
           PKL_FILES=$(curl -s -H "Authorization: token $GH_PAT" \
                        -H "Accept: application/vnd.github.v3+json" \
                        "https://api.github.com/repos/Alisson990jd/apiss/contents/analisar" | \
@@ -128,14 +124,14 @@ jobs:
 
       - name: 📂 Criar diretórios
         run: |
-          mkdir -p scripts temp_clips
+          mkdir -p scripts temp_clips thumbnails
 
       - name: 📝 Criar script otimizado
         run: |
           cat > scripts/clip_creator.py << 'SCRIPT_EOF'
           #!/usr/bin/env python3
           """
-          🎬 YouTube Clip Creator - OTIMIZADO PARA VELOCIDADE
+          🎬 YouTube Clip Creator - COM THUMBNAIL CORRIGIDA
           """
 
           import os
@@ -148,7 +144,6 @@ jobs:
           from pathlib import Path
           from datetime import datetime
           from typing import Optional, Dict, List
-          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           logging.basicConfig(
               level=logging.INFO,
@@ -161,6 +156,7 @@ jobs:
           logger = logging.getLogger(__name__)
 
           TEMP_DIR = Path("temp_clips")
+          THUMB_DIR = Path("thumbnails")
           PROCESSING_LOG = "processing_log.json"
 
 
@@ -212,64 +208,42 @@ jobs:
 
 
           def download_clip_segment_fast(vod_url: str, start_time: str, end_time: str, output_path: Path) -> bool:
-              """
-              Download ULTRA RÁPIDO usando aria2c com múltiplas conexões
-              """
-              logger.info(f"⬇️  Download rápido: {start_time} -> {end_time}")
+              """Download ULTRA RÁPIDO usando aria2c"""
+              logger.info(f"⬇️  Download: {start_time} -> {end_time}")
               
-              # Configurações aria2c para máxima velocidade
               aria2_args = [
-                  "--max-connection-per-server=16",  # 16 conexões por servidor
-                  "--split=16",                       # Dividir em 16 partes
-                  "--min-split-size=1M",             # Mínimo 1MB por parte
-                  "--max-concurrent-downloads=16",   # 16 downloads simultâneos
-                  "--file-allocation=none",          # Sem pré-alocação (mais rápido)
-                  "--continue=true",                 # Continuar downloads interrompidos
-                  "--max-tries=5",                   # 5 tentativas
-                  "--retry-wait=2",                  # 2 segundos entre tentativas
-                  "--timeout=60",                    # Timeout de 60s
-                  "--connect-timeout=30",            # Timeout de conexão 30s
-                  "--summary-interval=0",            # Sem resumo (menos output)
-                  "--console-log-level=warn",        # Menos logs
+                  "--max-connection-per-server=16",
+                  "--split=16",
+                  "--min-split-size=1M",
+                  "--max-concurrent-downloads=16",
+                  "--file-allocation=none",
+                  "--continue=true",
+                  "--max-tries=5",
+                  "--retry-wait=2",
+                  "--timeout=60",
+                  "--connect-timeout=30",
+                  "--console-log-level=warn",
               ]
               
               cmd = [
                   "yt-dlp",
-                  # Formato: melhor qualidade disponível
                   "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-                  
-                  # Segmento específico
                   "--download-sections", f"*{start_time}-{end_time}",
-                  
-                  # Usar aria2c como downloader externo (MUITO mais rápido)
                   "--downloader", "aria2c",
                   "--downloader-args", f"aria2c:{' '.join(aria2_args)}",
-                  
-                  # Otimizações de velocidade
                   "--concurrent-fragments", "16",
                   "--no-part",
                   "--no-mtime",
                   "--no-check-certificates",
-                  
-                  # Output
                   "--merge-output-format", "mp4",
                   "--output", str(output_path),
-                  
-                  # Silenciar um pouco
-                  "--no-warnings",
                   "--progress",
-                  
                   vod_url
               ]
               
               try:
                   start = time.time()
-                  result = subprocess.run(
-                      cmd, 
-                      capture_output=True, 
-                      text=True, 
-                      timeout=1200  # 20 min timeout
-                  )
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
                   elapsed = time.time() - start
                   
                   if result.returncode == 0 and output_path.exists():
@@ -278,12 +252,11 @@ jobs:
                       logger.info(f"   ✅ Baixado: {size_mb:.1f}MB em {elapsed:.1f}s ({speed:.1f} MB/s)")
                       return True
                   else:
-                      # Fallback sem aria2c
                       logger.warning(f"   ⚠️ aria2c falhou, tentando fallback...")
                       return download_clip_fallback(vod_url, start_time, end_time, output_path)
                       
               except subprocess.TimeoutExpired:
-                  logger.error("   ❌ Timeout no download")
+                  logger.error("   ❌ Timeout")
                   return False
               except Exception as e:
                   logger.error(f"   ❌ Erro: {e}")
@@ -292,8 +265,6 @@ jobs:
 
           def download_clip_fallback(vod_url: str, start_time: str, end_time: str, output_path: Path) -> bool:
               """Fallback sem aria2c"""
-              logger.info("   🔄 Tentando download alternativo...")
-              
               cmd = [
                   "yt-dlp",
                   "--format", "best[ext=mp4]/best",
@@ -316,50 +287,104 @@ jobs:
                   return False
 
 
-          def capture_thumbnail_fast(video_path: Path, timestamp: str, output_path: Path) -> bool:
-              """Captura frame rapidamente"""
-              cmd = [
+          def capture_thumbnail(video_path: Path, timestamp: str, output_path: Path) -> bool:
+              """
+              Captura frame do vídeo como thumbnail
+              Garante resolução 1280x720 (requerido pelo YouTube)
+              """
+              logger.info(f"📸 Capturando thumbnail em {timestamp}...")
+              
+              # Primeiro, captura o frame
+              temp_frame = output_path.with_suffix('.temp.png')
+              
+              cmd_capture = [
                   "ffmpeg", "-y",
                   "-ss", timestamp,
                   "-i", str(video_path),
                   "-vframes", "1",
-                  "-q:v", "2",
-                  "-f", "image2",
-                  str(output_path)
+                  "-q:v", "1",  # Máxima qualidade
+                  str(temp_frame)
               ]
+              
               try:
-                  result = subprocess.run(cmd, capture_output=True, timeout=30)
-                  return result.returncode == 0 and output_path.exists()
-              except:
+                  result = subprocess.run(cmd_capture, capture_output=True, text=True, timeout=30)
+                  
+                  if result.returncode != 0 or not temp_frame.exists():
+                      logger.error(f"   ❌ Falha na captura: {result.stderr}")
+                      return False
+                  
+                  # Agora redimensiona para 1280x720 (requisito do YouTube)
+                  cmd_resize = [
+                      "ffmpeg", "-y",
+                      "-i", str(temp_frame),
+                      "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                      "-q:v", "1",
+                      str(output_path)
+                  ]
+                  
+                  result = subprocess.run(cmd_resize, capture_output=True, text=True, timeout=30)
+                  
+                  # Remove temp
+                  if temp_frame.exists():
+                      temp_frame.unlink()
+                  
+                  if result.returncode == 0 and output_path.exists():
+                      size_kb = output_path.stat().st_size / 1024
+                      logger.info(f"   ✅ Thumbnail capturada: {size_kb:.1f}KB (1280x720)")
+                      return True
+                  else:
+                      logger.error(f"   ❌ Falha no resize: {result.stderr}")
+                      return False
+                      
+              except Exception as e:
+                  logger.error(f"   ❌ Erro: {e}")
                   return False
 
 
           def upload_to_youtube(video_path: Path, thumb_path: Optional[Path], clip_data: Dict, credentials: Dict) -> Optional[str]:
+              """Upload para YouTube com thumbnail"""
               logger.info("📤 Upload para YouTube...")
               
               try:
                   from google.auth.transport.requests import Request
                   from googleapiclient.discovery import build
                   from googleapiclient.http import MediaFileUpload
+                  from googleapiclient.errors import HttpError
                   
                   with open(credentials["pkl_file"], 'rb') as f:
                       creds = pickle.load(f)
                   
                   if creds and creds.expired and creds.refresh_token:
+                      logger.info("   🔄 Renovando token...")
                       creds.refresh(Request())
                       with open(credentials["pkl_file"], 'wb') as f:
                           pickle.dump(creds, f)
                   
                   service = build('youtube', 'v3', credentials=creds)
                   
+                  # Verificar canal
+                  try:
+                      channel_response = service.channels().list(part='snippet,status', mine=True).execute()
+                      if channel_response.get('items'):
+                          channel = channel_response['items'][0]
+                          logger.info(f"   📺 Canal: {channel['snippet']['title']}")
+                  except Exception as e:
+                      logger.warning(f"   ⚠️ Não foi possível verificar canal: {e}")
+                  
                   category_map = {"gaming": "20", "entertainment": "24", "IRL": "22", "react": "24"}
                   category_id = category_map.get(clip_data.get("category", "").lower(), "22")
                   
+                  title = clip_data.get("title", "Clip")[:100]
+                  description = clip_data.get("recommended_description", "")[:5000]
+                  tags = clip_data.get("tags", [])[:500]
+                  
+                  logger.info(f"   📝 Título: {title}")
+                  
                   body = {
                       'snippet': {
-                          'title': clip_data.get("title", "Clip")[:100],
-                          'description': clip_data.get("recommended_description", "")[:5000],
-                          'tags': clip_data.get("tags", [])[:500],
+                          'title': title,
+                          'description': description,
+                          'tags': tags,
                           'categoryId': category_id,
                       },
                       'status': {
@@ -368,32 +393,85 @@ jobs:
                       }
                   }
                   
-                  media = MediaFileUpload(str(video_path), chunksize=10*1024*1024, resumable=True, mimetype='video/mp4')
-                  request = service.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
+                  # Upload do vídeo
+                  media = MediaFileUpload(
+                      str(video_path), 
+                      chunksize=10*1024*1024, 
+                      resumable=True, 
+                      mimetype='video/mp4'
+                  )
+                  
+                  request = service.videos().insert(
+                      part=','.join(body.keys()), 
+                      body=body, 
+                      media_body=media
+                  )
                   
                   response = None
                   while response is None:
                       status, response = request.next_chunk()
                       if status:
-                          logger.info(f"   Upload: {int(status.progress() * 100)}%")
+                          progress = int(status.progress() * 100)
+                          logger.info(f"   📤 Upload: {progress}%")
                   
                   video_id = response.get('id')
                   
-                  if video_id and thumb_path and thumb_path.exists():
-                      try:
-                          thumb_media = MediaFileUpload(str(thumb_path), mimetype='image/png')
-                          service.thumbnails().set(videoId=video_id, media_body=thumb_media).execute()
-                          logger.info("   ✅ Thumbnail OK!")
-                      except Exception as e:
-                          logger.warning(f"   ⚠️ Thumb erro: {e}")
+                  if not video_id:
+                      logger.error("   ❌ Nenhum video_id retornado!")
+                      return None
                   
-                  if video_id:
-                      logger.info(f"   ✅ https://youtube.com/watch?v={video_id}")
+                  logger.info(f"   ✅ Vídeo enviado: {video_id}")
+                  logger.info(f"   🔗 https://youtube.com/watch?v={video_id}")
+                  
+                  # Upload da thumbnail
+                  if thumb_path and thumb_path.exists():
+                      thumb_size = thumb_path.stat().st_size
+                      logger.info(f"   🖼️ Enviando thumbnail ({thumb_size/1024:.1f}KB)...")
+                      
+                      if thumb_size < 100:
+                          logger.error(f"   ❌ Thumbnail muito pequena ({thumb_size} bytes)")
+                      else:
+                          try:
+                              thumb_media = MediaFileUpload(
+                                  str(thumb_path), 
+                                  mimetype='image/png',
+                                  resumable=False
+                              )
+                              
+                              thumb_response = service.thumbnails().set(
+                                  videoId=video_id, 
+                                  media_body=thumb_media
+                              ).execute()
+                              
+                              if thumb_response:
+                                  logger.info(f"   ✅ Thumbnail definida com sucesso!")
+                                  logger.info(f"      URL: {thumb_response.get('items', [{}])[0].get('default', {}).get('url', 'N/A')}")
+                              else:
+                                  logger.warning("   ⚠️ Resposta vazia da API de thumbnail")
+                                  
+                          except HttpError as e:
+                              error_content = e.content.decode() if hasattr(e, 'content') else str(e)
+                              logger.error(f"   ❌ Erro HTTP ao definir thumbnail: {e.resp.status}")
+                              logger.error(f"      Detalhes: {error_content}")
+                              
+                              if e.resp.status == 403:
+                                  logger.error("   ⚠️ O canal pode não ter permissão para thumbnails customizadas")
+                                  logger.error("   ⚠️ Verifique se o canal está verificado no YouTube")
+                              
+                          except Exception as e:
+                              logger.error(f"   ❌ Erro ao definir thumbnail: {type(e).__name__}: {e}")
+                  else:
+                      logger.warning(f"   ⚠️ Thumbnail não encontrada: {thumb_path}")
                   
                   return video_id
                   
+              except HttpError as e:
+                  logger.error(f"   ❌ Erro HTTP: {e.resp.status} - {e.content.decode()}")
+                  return None
               except Exception as e:
-                  logger.error(f"   ❌ Erro: {e}")
+                  logger.error(f"   ❌ Erro: {type(e).__name__}: {e}")
+                  import traceback
+                  traceback.print_exc()
                   return None
 
 
@@ -401,37 +479,65 @@ jobs:
               clip_id = clip_data.get("clip_id", f"clip_{idx}")
               
               logger.info("")
-              logger.info("=" * 50)
+              logger.info("=" * 60)
               logger.info(f"🎬 [{idx+1}/{total}] {clip_id}")
-              logger.info(f"   {clip_data.get('title', 'N/A')[:50]}...")
-              logger.info(f"   ⏱️ {clip_data.get('start_time')} → {clip_data.get('end_time')}")
-              logger.info("=" * 50)
+              logger.info(f"   📝 {clip_data.get('title', 'N/A')[:60]}...")
+              logger.info(f"   ⏱️  {clip_data.get('start_time')} → {clip_data.get('end_time')}")
+              logger.info(f"   📸 Thumbnail em: {clip_data.get('thumbnail_timestamp', 'N/A')}")
+              logger.info("=" * 60)
               
-              result = {"clip_id": clip_id, "title": clip_data.get("title"), "status": "pending", "video_id": None, "error": None}
+              result = {
+                  "clip_id": clip_id, 
+                  "title": clip_data.get("title"), 
+                  "status": "pending", 
+                  "video_id": None, 
+                  "error": None,
+                  "thumbnail_status": "pending"
+              }
               
               video_path = TEMP_DIR / f"{clip_id}.mp4"
-              frame_path = TEMP_DIR / f"{clip_id}_thumb.png"
+              thumb_path = THUMB_DIR / f"{clip_id}_thumb.png"
               
               try:
-                  # Download
-                  if not download_clip_segment_fast(vod_url, clip_data.get("start_time"), clip_data.get("end_time"), video_path):
+                  # 1. Download do clipe
+                  if not download_clip_segment_fast(
+                      vod_url, 
+                      clip_data.get("start_time"), 
+                      clip_data.get("end_time"), 
+                      video_path
+                  ):
                       result["status"] = "failed"
                       result["error"] = "Download falhou"
                       return result
                   
-                  # Thumbnail
+                  # 2. Captura da thumbnail
                   thumb_ts = clip_data.get("thumbnail_timestamp", clip_data.get("start_time"))
                   start_sec = time_to_seconds(clip_data.get("start_time", "00:00:00"))
                   thumb_sec = time_to_seconds(thumb_ts)
                   rel_thumb = seconds_to_time(max(0, thumb_sec - start_sec))
-                  capture_thumbnail_fast(video_path, rel_thumb, frame_path)
                   
-                  # Upload
-                  video_id = upload_to_youtube(video_path, frame_path if frame_path.exists() else None, clip_data, credentials)
+                  thumb_success = capture_thumbnail(video_path, rel_thumb, thumb_path)
+                  
+                  if thumb_success and thumb_path.exists():
+                      result["thumbnail_status"] = "captured"
+                      logger.info(f"   ✅ Thumbnail pronta: {thumb_path}")
+                  else:
+                      result["thumbnail_status"] = "failed"
+                      logger.warning(f"   ⚠️ Thumbnail não capturada")
+                      thumb_path = None
+                  
+                  # 3. Upload para YouTube
+                  video_id = upload_to_youtube(
+                      video_path, 
+                      thumb_path if thumb_path and thumb_path.exists() else None, 
+                      clip_data, 
+                      credentials
+                  )
                   
                   if video_id:
                       result["status"] = "success"
                       result["video_id"] = video_id
+                      result["url"] = f"https://youtube.com/watch?v={video_id}"
                   else:
                       result["status"] = "failed"
                       result["error"] = "Upload falhou"
@@ -440,22 +546,26 @@ jobs:
                   result["status"] = "error"
                   result["error"] = str(e)
                   logger.error(f"   ❌ {e}")
+                  import traceback
+                  traceback.print_exc()
+                  
               finally:
-                  # Limpar
-                  for p in [video_path, frame_path]:
-                      try:
-                          if p.exists():
-                              p.unlink()
-                      except:
-                          pass
+                  # Limpar vídeo (manter thumbnail para debug)
+                  try:
+                      if video_path.exists():
+                          video_path.unlink()
+                          logger.info(f"   🗑️ Vídeo removido")
+                  except:
+                      pass
               
               return result
 
 
           def main():
-              logger.info("=" * 50)
-              logger.info("🎬 YOUTUBE CLIP CREATOR - TURBO MODE")
-              logger.info("=" * 50)
+              logger.info("")
+              logger.info("=" * 60)
+              logger.info("🎬 YOUTUBE CLIP CREATOR")
+              logger.info("=" * 60)
               
               if len(sys.argv) < 2:
                   logger.error("❌ Uso: python clip_creator.py <VOD_URL>")
@@ -465,17 +575,22 @@ jobs:
               logger.info(f"📹 VOD: {vod_url}")
               
               TEMP_DIR.mkdir(exist_ok=True)
+              THUMB_DIR.mkdir(exist_ok=True)
               
               try:
                   clips = load_clips_config()
                   creds = load_youtube_credentials()
               except Exception as e:
                   logger.error(f"❌ {e}")
+                  import traceback
+                  traceback.print_exc()
                   sys.exit(1)
               
               if not clips:
                   logger.warning("⚠️ Nenhum clipe YouTube!")
                   sys.exit(0)
+              
+              logger.info(f"📋 {len(clips)} clipes para processar")
               
               results = []
               total = len(clips)
@@ -494,6 +609,7 @@ jobs:
                   "total": len(results),
                   "success": len([r for r in results if r["status"] == "success"]),
                   "failed": len([r for r in results if r["status"] != "success"]),
+                  "thumbnails_ok": len([r for r in results if r.get("thumbnail_status") == "captured"]),
                   "clips": results
               }
               
@@ -501,11 +617,21 @@ jobs:
                   json.dump(summary, f, indent=2, ensure_ascii=False)
               
               logger.info("")
-              logger.info("=" * 50)
-              logger.info("📊 RESUMO")
-              logger.info(f"   ✅ Sucesso: {summary['success']}/{summary['total']}")
-              logger.info(f"   ❌ Falhas: {summary['failed']}/{summary['total']}")
-              logger.info("=" * 50)
+              logger.info("=" * 60)
+              logger.info("📊 RESUMO FINAL")
+              logger.info("=" * 60)
+              logger.info(f"   📹 Vídeos: {summary['success']}/{summary['total']} sucesso")
+              logger.info(f"   🖼️  Thumbnails: {summary['thumbnails_ok']}/{summary['total']} capturadas")
+              logger.info(f"   ❌ Falhas: {summary['failed']}")
+              logger.info("=" * 60)
+              
+              # Lista vídeos enviados
+              logger.info("")
+              logger.info("📺 VÍDEOS ENVIADOS:")
+              for r in results:
+                  if r["status"] == "success":
+                      logger.info(f"   ✅ {r['title'][:50]}...")
+                      logger.info(f"      {r.get('url', 'N/A')}")
 
 
           if __name__ == "__main__":
@@ -529,13 +655,18 @@ jobs:
             cat processing_log.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🖼️ Thumbnails" >> $GITHUB_STEP_SUMMARY
+          ls -la thumbnails/ 2>/dev/null || echo "Nenhuma thumbnail encontrada"
 
-      - name: 📤 Upload logs
+      - name: 📤 Upload logs e thumbnails
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs
+          name: logs-and-thumbnails
           path: |
             *.log
             processing_log.json
+            thumbnails/
           retention-days: 7
